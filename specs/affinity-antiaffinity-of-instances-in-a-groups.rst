@@ -1,61 +1,161 @@
+..
+ This work is licensed under a Creative Commons Attribution 3.0 Unported
+ License.
+
+ http://creativecommons.org/licenses/by/3.0/legalcode
+
 ===============================================
 Affinity/Anti Affinity of instances in a groups
 ===============================================
 
-This task can be divided into two separate parts. First is a change of behavior
-of host aggregates, to be able to include ironic nodes. Second, involves
-changes to the scheduler to support spreading instances across various groups.
+https://blueprints.launchpad.net/nova/+spec/tbd
 
-Questions
+This BP proposes a way for creating affinity and anti-affinity for ironic nodes.
+
+Problem description
+===================
+
+Currently there is no way to create aggregation for Ironic nodes, instead
+aggregates works only for compute nodes, so it is impossible for creating
+affinity/anti-affinity rules for such nodes
+
+Use Cases
 ---------
 
-There are several ways that aggregate (anti)affinity could be defined
-expressed.
+As a system administrator I want to be able to define aggregation of the Ironic
+nodes in Nova, so that I can apply affinity or anti-affinity policy to the
+server group.
 
-#. Pass through hints, both information about server group and condition for
-   server placement against host aggregates:
+As a system administrator I want to be able to define aggregation of the Ironic
+nodes in Nova, so that I can define logical division of my data center.
 
-   .. code:: shell-session
+Proposed change
+===============
 
-      openstack aggregate-create rack1
-      openstack aggregate-create rack2
-      openstack aggregate-set-metadata rack1 rack=1
-      openstack aggregate-set-metadata rack2 rack=1
-      openstack aggregate-add-host rack1 <UUID of Ironic node A>
-      openstack aggregate-add-host rack2 <UUID of Ironic node B>
-      openstack server-group-create not-same-rack anti-affinity
-      openstack server create --image=IMAGE_ID --flavor=1 \
-          --hint group=not-same-rack --hint property=rack
+This task can be divided into two separate parts. First is a change of behavior
+of host aggregates, to be able to include ironic nodes.
 
-#. Implement own policies to set on instance groups, like
-   ``rack_antiaffinity``, ``pz_antiaffinity`` etc, and than during boot time
-   just pass a server group name. For instance:
+Second, involves changes to the scheduler to support spreading instances across
+various groups.
 
-   .. code:: shell-session
+Example session, which present the change, could be as follows:
 
-      openstack aggregate-create rack1
-      openstack aggregate-create rack2
-      openstack aggregate-set-metadata rack1 rack=1
-      openstack aggregate-set-metadata rack2 rack=1
-      openstack aggregate-add-host rack1 <UUID of Ironic node A>
-      openstack aggregate-add-host rack2 <UUID of Ironic node B>
-      openstack server-group-create not-same-rack rack-anti-affinity
-      openstack server create --image=IMAGE_ID --flavor=1 \
-          --hint group=not-same-rack
+.. code:: shell-session
 
-#. Hardcode policy into the server group name, but this requires from users, to
-   be very strict about naming of server groups:
+   openstack aggregate create rack1
+   openstack aggregate create rack2
+   openstack aggregate set --property rack=1 rack1
+   openstack aggregate set --property rack=1 rack2
+   openstack aggregate add host rack1 <UUID of Ironic node A>
+   openstack aggregate add host rack2 <UUID of Ironic node B>
+   openstack server group create --policy rack-anti-affinity not-same-rack
+   openstack server create --image=IMAGE_ID --flavor=1 \
+       --hint group=not-same-rack server1
 
-   .. code:: shell-session
+First, we create two aggregates which would represent the rack, next we append
+a rack metadata set to 1, so it indicate that this aggregate is ``rack`` based,
+next we add ironic nodes by their UUID. Next, we create server group, with
+desired policy, and finally spin the instance.
 
-      openstack aggregate-create rack1
-      openstack aggregate-create rack2
-      openstack aggregate-set-metadata rack1 rack=1
-      openstack aggregate-set-metadata rack2 rack=1
-      openstack aggregate-add-host rack1 <UUID of Ironic node A>
-      openstack aggregate-add-host rack2 <UUID of Ironic node B>
-      openstack server-group-create rack-<unique-name> anti-affinity
-      openstack server create --image=IMAGE_ID --flavor=1 \
-          --hint group=rack-<unique-name>
+Alternatives
+------------
 
-Which solution should we take?
+None
+
+Data model impact
+-----------------
+
+None
+
+REST API impact
+---------------
+
+Introduce new microversion for adding new policies for node
+(soft)(anti)affinity
+
+Security impact
+---------------
+
+None
+
+Notifications impact
+--------------------
+
+None
+
+Other end user impact
+---------------------
+
+None
+
+Performance Impact
+------------------
+
+Potentially, there could be performance impact on accessing aggregation
+information.
+
+Other deployer impact
+---------------------
+
+None
+
+Developer impact
+----------------
+
+None
+
+Upgrade impact
+--------------
+
+None
+
+Implementation
+==============
+
+Assignee(s)
+-----------
+
+Primary assignee:
+  <launchpad-id or None>
+
+Other contributors:
+  <launchpad-id or None>
+
+Work Items
+----------
+
+* Allow ironic nodes to be associated with host aggregation
+* Add policy for affinity/anti-affinity/soft-affinity/soft-anti-affinity for
+  nodes, instead of hypervisors
+* Implement scheduler filter for be able to use those policies
+
+Dependencies
+============
+
+None
+
+Testing
+=======
+
+TBD
+
+Documentation Impact
+====================
+
+Documentation of behaviour of creating/removing aggregation should be amended.
+
+References
+==========
+
+None
+
+History
+=======
+
+.. list-table:: Revisions
+   :header-rows: 1
+
+   * - Release Name
+     - Description
+   * - Rocky
+     - Introduced
