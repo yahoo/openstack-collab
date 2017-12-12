@@ -15,18 +15,18 @@ This BP proposes a way for creating affinity and anti-affinity for ironic nodes.
 Problem description
 ===================
 
-Currently there is no way to create aggregation for Ironic nodes, instead
+Currently there is no way to create host-aggregates for Ironic nodes, instead
 aggregates works only for compute nodes, so it is impossible for creating
 affinity/anti-affinity rules for such nodes
 
 Use Cases
 ---------
 
-As a system administrator I want to be able to define aggregation of the Ironic
+As a system administrator I want to be able to define aggregates of the Ironic
 nodes in Nova, so that I can apply affinity or anti-affinity policy to the
 server group.
 
-As a system administrator I want to be able to define aggregation of the Ironic
+As a system administrator I want to be able to define aggregates of the Ironic
 nodes in Nova, so that I can define logical division of my data center.
 
 Proposed change
@@ -91,7 +91,7 @@ None
 Performance Impact
 ------------------
 
-Potentially, there could be performance impact on accessing aggregation
+Potentially, there could be performance impact on accessing aggregates
 information.
 
 Other deployer impact
@@ -124,10 +124,10 @@ Other contributors:
 Work Items
 ----------
 
-* Allow ironic nodes to be associated with host aggregation
+* Allow ironic nodes to be associated with host aggregates
 * Add policy for affinity/anti-affinity/soft-affinity/soft-anti-affinity for
-  nodes, instead of hypervisors
-* Implement scheduler filter for be able to use those policies
+  host-aggregates, instead of hypervisors
+* Implement scheduler filter to be able to use those policies
 
 Dependencies
 ============
