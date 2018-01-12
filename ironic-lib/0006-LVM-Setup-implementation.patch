@@ -1,0 +1,918 @@
+From d14c463e95c0db7b1c5e9b6745565a134d55e355 Mon Sep 17 00:00:00 2001
+From: PiotrProkop <piotr.prokop@intel.com>
+Date: Fri, 29 Dec 2017 11:30:43 +0100
+Subject: [PATCH 06/11] LVM Setup implementation
+
+Co-Authored-By: Piotr Prokop <piotr.prokop@intel.com>
+Co-Authored-By: Marta Mucek <marta.mucek@intel.com>
+---
+ ironic_lib/system_installer/lvmsetup.py            | 228 ++++++++++
+ ironic_lib/tests/examples/example2.yml             |  31 ++
+ .../tests/examples/example_lvm_filesystem.yaml     |  32 ++
+ .../tests/examples/example_multiple_pvs.yaml       |  33 ++
+ .../tests/examples/example_with_si_format.yml      |  38 ++
+ ironic_lib/tests/test_lvm.py                       | 479 +++++++++++++++++++++
+ 6 files changed, 841 insertions(+)
+ create mode 100644 ironic_lib/tests/examples/example2.yml
+ create mode 100644 ironic_lib/tests/examples/example_lvm_filesystem.yaml
+ create mode 100644 ironic_lib/tests/examples/example_multiple_pvs.yaml
+ create mode 100644 ironic_lib/tests/examples/example_with_si_format.yml
+ create mode 100644 ironic_lib/tests/test_lvm.py
+
+diff --git a/ironic_lib/system_installer/lvmsetup.py b/ironic_lib/system_installer/lvmsetup.py
+index 890c95d..89f61c4 100644
+--- a/ironic_lib/system_installer/lvmsetup.py
++++ b/ironic_lib/system_installer/lvmsetup.py
+@@ -12,8 +12,14 @@
+ # implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++import json
++import subprocess
++
++import bitmath
+ 
+ from ironic_lib.system_installer.base import Setup
++from ironic_lib.system_installer import exceptions
++from ironic_lib.system_installer import tools
+ 
+ 
+ class LvmSetup(Setup):
+@@ -21,8 +27,230 @@ class LvmSetup(Setup):
+ 
+     conf_key = 'lvm'
+ 
++    SI_SUFFIXES = ['k', 'M', 'G', 'T', 'P']
++
++    def _get_size_in_bytes(self, device):
++        size = subprocess.check_output(['lsblk', '-b', '-o', 'SIZE', '-n',
++                                        str(device)])
++        return int(size)
++
++    def _get_pvs_size_in_bytes(self, pvs, devices):
++        size = bitmath.Byte(0)
++        for pv in pvs:
++            size += bitmath.Byte(self._get_size_in_bytes(devices[pv]))
++        return size
++
++    # we rather use G as Gi, k as ki etc.
++    def _convert_formats(self, value):
++        if value[-1] in self.SI_SUFFIXES:
++            return value + "iB"
++        return value
++
++    def _get_lvs_size_in_bytes(self, lvs):
++        size = bitmath.Byte(0)
++        for lv in lvs.keys():
++            if lvs[lv].get('minsize'):
++                minsize = self._convert_formats(lvs[lv]['minsize'])
++                size += bitmath.parse_string_unsafe(minsize)
++            elif lvs[lv].get('size'):
++                if lvs[lv]['size'] == 'memsize':
++                    size += bitmath.KiB(int(tools.get_memsize_kB()))
++                else:
++                    converted_size = self._convert_formats(lvs[lv]['size'])
++                    size += bitmath.parse_string_unsafe(converted_size)
++        return size
++
++    def validate_lvm_size(self, devices):
++        for vg in self.conf.keys():
++            pv_size = self._get_pvs_size_in_bytes(self.conf[vg]['PVs'],
++                                                  devices)
++            lv_size = self._get_lvs_size_in_bytes(self.conf[vg]['LVs'])
++            if pv_size < lv_size:
++                msg = "LVs requires more space than PVs can offer."
++                raise exceptions.ConfError(msg)
++
++    def validate_conf(self):
++        for vg in self.conf.keys():
++            if '-' in vg:
++                msg = "VG name can't contain \"-\" symbol"
++                raise exceptions.ConfError(msg)
++
+     def get_src_names(self):
+         return sum([list(v['PVs']) for v in self.conf.values()], [])
+ 
+     def get_dst_names(self):
+         return sum([list(v['LVs']) for v in self.conf.values()], [])
++
++    def _get_vg_names(self):
++        """Extract volume groups names"""
++        return list(self.conf.keys())
++
++    def _get_pv_names(self, devices):
++        """Extract physical volumes names"""
++        return list(devices.values())
++
++    def _get_pvs_of_vg(self, vg, devices):
++        """Get physical volumes of given volume group"""
++        return [devices[v] for v in list(self.conf[vg]['PVs'])]
++
++    def _get_lvs_of_vg(self, vg):
++        """Get logical volumes of given volume group"""
++        return self.conf[vg]['LVs']
++
++    def _create_pvs(self, vg, devices):
++        """create physical volumes out of precreated partitions/disks"""
++        existing_pvs = self._get_pvs()
++        for pv in self._get_pvs_of_vg(vg, devices):
++            if pv not in existing_pvs:
++                # -ff because a physical volume belonging
++                # to an existing volume group can't be recreated
++                subprocess.check_call(['pvcreate', '-ff', pv])
++
++    def _create_vg(self, vg, devices):
++        existing_vgs = self._get_vgs()
++        if vg not in existing_vgs:
++            cmd = ["vgcreate", "-y", vg]
++            cmd.extend(self._get_pvs_of_vg(vg, devices))
++            subprocess.check_call(cmd)
++
++    def _create_lv(self, lv, vg, size, minsize=False):
++        cmd = ['lvcreate']
++        if minsize:
++            cmd.extend(['-l', '{}%FREE'.format(size)])
++        else:
++            cmd.extend(['-L', str(size)])
++
++        cmd.extend(['-y', '-Wy', '-Zy', '-n', lv, vg])
++        subprocess.check_call(cmd)
++
++        return "/dev/{vg}/{lv}".format(vg=vg, lv=lv)
++
++    def _create_lvs(self, vg):
++        """Create logical volumes for given volume group"""
++        lvs = self._get_lvs_of_vg(vg)
++        # filter out lvs with minsize set
++        minsize_lvs = [v for v in lvs if lvs[v].get('minsize')]
++        size_lvs = [v for v in lvs if lvs[v].get('size')]
++        # create lvs with a predefined size
++        existing_lvs = self._get_lvs()
++        created_lvs = dict()
++        for lv in size_lvs:
++            size = lvs[lv]['size']
++            if size == 'memsize':
++                size = "{}K".format(tools.get_memsize_kB())
++
++            if "/dev/{vg}/{lv}".format(vg=vg, lv=lv) not in existing_lvs:
++                created_lvs[lv] = self._create_lv(lv, vg, size)
++
++        # divide all available memory between machines with minsize set
++        size = int(100 / len(minsize_lvs))
++        for lv in minsize_lvs:
++            created_lvs[lv] = self._create_lv(lv, vg, size, True)
++
++        return created_lvs
++
++    def _get_vgs(self):
++        vgs_output = subprocess.check_output(['vgs', '--reportformat', 'json'])
++        vgs = json.loads(vgs_output)
++        vgs = vgs['report'][0]['vg']
++        vgs_names = []
++        for vg in vgs:
++            vgs_names.append(vg['vg_name'])
++
++        return vgs_names
++
++    @classmethod
++    def _remove_vgs(self, vgs_to_remove):
++        for vg in vgs_to_remove:
++            subprocess.check_call(['vgremove', '-y', vg])
++
++    def _get_pvs(self):
++        pvs_output = subprocess.check_output(['pvs', '--reportformat', 'json'])
++        pvs = json.loads(pvs_output)
++        pvs = pvs['report'][0]['pv']
++        pvs_names = []
++        for pv in pvs:
++            pvs_names.append(pv['pv_name'])
++        return pvs_names
++
++    @classmethod
++    def _remove_pvs(self, pvs_to_remove):
++        for pv in pvs_to_remove:
++            subprocess.check_call(['pvremove', '-y', pv])
++
++    @classmethod
++    def _get_lvs(self):
++        lvs_output = subprocess.check_output(['lvs', '--reportformat', 'json'])
++        lvs = json.loads(lvs_output)
++        lvs = lvs['report'][0]['lv']
++        lvs_names = []
++        for lv in lvs:
++            lvs_names.append(
++                '/dev/{vg}/{lv}'.format(vg=lv['vg_name'], lv=lv['lv_name']))
++        return lvs_names
++
++    @classmethod
++    def _remove_lvs(self, lvs_to_remove):
++        for lv in lvs_to_remove:
++            subprocess.check_call(['lvremove', '-y', lv])
++
++    def _is_dev_lv(self, device):
++        try:
++            subprocess.check_call(['lvdisplay', device])
++        except subprocess.CalledProcessError:
++            return False
++
++        return True
++
++    @classmethod
++    def _get_empty_vgs(self):
++        empty_vgs = []
++        vgs_output = subprocess.check_output(['vgs', '--reportformat', 'json'])
++        vgs_json = json.loads(vgs_output)
++        for vg in vgs_json['report'][0]['vg']:
++            if vg['lv_count'] == '0':
++                empty_vgs.append(vg['vg_name'])
++
++        return empty_vgs
++
++    @classmethod
++    def _get_empty_pvs(self):
++        empty_pvs = []
++        pvs_output = subprocess.check_output(['pvs', '--reportformat', 'json'])
++        pvs_json = json.loads(pvs_output)
++        for pv in pvs_json['report'][0]['pv']:
++            if pv['vg_name'] == "":
++                empty_pvs.append(pv['pv_name'])
++
++        return empty_pvs
++
++    @classmethod
++    def clean_disks(self, excluded_devices):
++        # removing lvs
++        lvs_to_remove = []
++        for lv in self._get_lvs():
++            if lv in excluded_devices.values():
++                continue
++            lvs_to_remove.append(lv)
++
++        if lvs_to_remove:
++            self._remove_lvs(lvs_to_remove)
++        # removing vgs
++        empty_vgs = self._get_empty_vgs()
++        if empty_vgs:
++            self._remove_vgs(empty_vgs)
++        # removing pvs
++        empty_pvs = self._get_empty_pvs()
++        if empty_pvs:
++            self._remove_pvs(empty_pvs)
++
++    def setup_disks(self, devices):
++        self.validate_lvm_size(devices)
++        self.validate_conf()
++        lvs = dict()
++        for vg in self._get_vg_names():
++            self._create_pvs(vg, devices)
++            self._create_vg(vg, devices)
++            lvs.update(self._create_lvs(vg))
++        devices.update(lvs)
++        return devices
+diff --git a/ironic_lib/tests/examples/example2.yml b/ironic_lib/tests/examples/example2.yml
+new file mode 100644
+index 0000000..58f9299
+--- /dev/null
++++ b/ironic_lib/tests/examples/example2.yml
+@@ -0,0 +1,31 @@
++disk_config:
++  blockdev:
++    sda:
++      candidates: any
++      partitions:
++        d0p1:
++          size: 10G
++        d0p2:
++          minsize: 2G
++  lvm:
++    sys:
++      LVs:
++        home:
++          minsize: 1G
++        root:
++          size: 10G
++      PVs:
++        - d0p2
++    tmp:
++      LVs:
++        tmp:
++          minsize: 512M
++      PVs:
++        - d0p1
++  filesystems:
++    home:
++      mountpoint: /home
++    root:
++      mountpoint: /
++    tmp:
++      mountpoint: /tmp
+diff --git a/ironic_lib/tests/examples/example_lvm_filesystem.yaml b/ironic_lib/tests/examples/example_lvm_filesystem.yaml
+new file mode 100644
+index 0000000..8264e9f
+--- /dev/null
++++ b/ironic_lib/tests/examples/example_lvm_filesystem.yaml
+@@ -0,0 +1,32 @@
++disk_config:
++  blockdev:
++    sda:
++      candidates: any
++      partitions:
++        d0p1:
++          size: 16G
++        d0p2:
++          minsize: 2G
++  lvm:
++    sys:
++      LVs:
++        home:
++          minsize: 1G
++        root:
++          size: 10G
++        swap:
++          size: 32G
++        var:
++          size: 4G
++        tmp:
++          size: 4G
++      PVs:
++        - d0p2
++  filesystems:
++    d0p1:
++      label: /boot
++      mountpoint: /boot
++    home:
++      mountpoint: /home
++    root:
++      mountpoint: /
+\ No newline at end of file
+diff --git a/ironic_lib/tests/examples/example_multiple_pvs.yaml b/ironic_lib/tests/examples/example_multiple_pvs.yaml
+new file mode 100644
+index 0000000..f9d22a1
+--- /dev/null
++++ b/ironic_lib/tests/examples/example_multiple_pvs.yaml
+@@ -0,0 +1,33 @@
++disk_config:
++  blockdev:
++    sda:
++      candidates: any
++      partitions:
++        d0p1:
++          size: 512M
++        d0p2:
++          minsize: 2G
++  lvm:
++    sys:
++      LVs:
++        home:
++          minsize: 1G
++        root:
++          size: 10G
++        swap:
++          size: 32G
++        var:
++          size: 4G
++        tmp:
++          size: 4G
++      PVs:
++        - d0p2
++        - d0p1
++  filesystems:
++    var:
++      label: boot
++      mountpoint: /boot
++    home:
++      mountpoint: /home
++    root:
++      mountpoint: /
+diff --git a/ironic_lib/tests/examples/example_with_si_format.yml b/ironic_lib/tests/examples/example_with_si_format.yml
+new file mode 100644
+index 0000000..c77bbb3
+--- /dev/null
++++ b/ironic_lib/tests/examples/example_with_si_format.yml
+@@ -0,0 +1,38 @@
++disk_config:
++  blockdev:
++    sda:
++      candidates: any
++      partitions:
++        d0p1:
++          size: 512MB
++        d0p2:
++          minsize: 2GB
++  lvm:
++    sys:
++      LVs:
++        home:
++          minsize: 1GB
++        root:
++          size: 10GB
++        swap:
++          size: memsize
++        var:
++          size: 4GB
++        tmp:
++          size: 4GB
++      PVs:
++        - d0p2
++  filesystems:
++    d0p1:
++      label: /boot
++      mountpoint: /boot
++    home:
++      mountpoint: /home
++    root:
++      mountpoint: /
++    swap:
++      fstype: swap
++    var:
++      mountpoint: /var
++    tmp:
++      mountpoint: /tmp
+diff --git a/ironic_lib/tests/test_lvm.py b/ironic_lib/tests/test_lvm.py
+new file mode 100644
+index 0000000..6738e18
+--- /dev/null
++++ b/ironic_lib/tests/test_lvm.py
+@@ -0,0 +1,479 @@
++# Copyright (c) 2018 Intel Corporation
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++# implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import unittest
++
++import bitmath
++import mock
++import subprocess
++import yaml
++
++from ironic_lib.system_installer import exceptions
++from ironic_lib.system_installer import LvmSetup
++
++
++class LvmTest(unittest.TestCase):
++
++    def setUp(self):
++        with open('ironic_lib/tests/examples/example1.yaml') as f:
++            conf = yaml.load(f)
++        self.lvm = LvmSetup(conf['disk_config'])
++        self.devices = {"d0p2": "/dev/sda"}
++
++    def test_validate_conf(self):
++        lvm_setup = LvmSetup({
++            'lvm': {
++                'foo': {'LVs': {'home': {'minsize': '1G'}},
++                        'PVs': ['d0p2']}
++            }
++        })
++        lvm_setup.validate_conf()
++
++    def test_validate_conf_error(self):
++        lvm_setup = LvmSetup({
++            'lvm': {
++                'sys-1': {'LVs': {'home': {'minsize': '1G'}},
++                          'PVs': ['d0p2']}
++            }
++        })
++        with self.assertRaises(exceptions.ConfError):
++            lvm_setup.validate_conf()
++
++    @mock.patch('subprocess.check_output')
++    def test_get_size_in_bytes(self, exe):
++        exe.return_value = '40000'
++        self.assertEqual(40000, self.lvm._get_size_in_bytes("/dev/sda"))
++        exe.assert_any_call(['lsblk', '-b', '-o', 'SIZE', '-n', '/dev/sda'])
++
++    @mock.patch('subprocess.check_output')
++    def test_get_pvs_size_in_bytes(self, exe):
++        exe.side_effect = ['40000', '20000']
++        with open('ironic_lib/tests/examples/example_multiple_pvs.yaml') as f:
++            conf = yaml.load(f)
++        devices = self.devices = {"d0p2": "/dev/sda", "d0p1": "/dev/sdb"}
++        lvm_conf = conf['disk_config']
++        lvm = LvmSetup(lvm_conf)
++        self.assertEqual(bitmath.Byte(60000),
++                         lvm._get_pvs_size_in_bytes(
++                             lvm_conf['lvm']['sys']['PVs'], devices))
++        exe.assert_any_call(['lsblk', '-b', '-o', 'SIZE', '-n', '/dev/sda'])
++        exe.assert_any_call(['lsblk', '-b', '-o', 'SIZE', '-n', '/dev/sdb'])
++
++    def test_convert_formats(self):
++        for suffix in self.lvm.SI_SUFFIXES:
++            self.assertEqual(suffix + "iB", self.lvm._convert_formats(suffix))
++        test_suffixes = ["GB", "kB", "MB"]
++        for suffix in test_suffixes:
++            self.assertEqual(suffix, self.lvm._convert_formats(suffix))
++
++    @mock.patch('ironic_lib.system_installer.tools.get_memsize_kB')
++    def test_get_lvs_size_in_bytes(self, mem):
++        mem.return_value = '1'
++        lvs = self.lvm._get_lvs_of_vg('sys')
++        self.assertEqual(bitmath.Byte(20401095680),
++                         self.lvm._get_lvs_size_in_bytes(lvs))
++
++    @mock.patch('ironic_lib.system_installer.tools.get_memsize_kB')
++    def test_get_lvs_size_in_bytes_si_format(self, mem):
++        mem.return_value = '1'
++        with open('ironic_lib/tests/examples/example_with_si_format.yml') as f:
++            conf = yaml.load(f)
++        lvm_conf = conf['disk_config']
++        lvm = LvmSetup(lvm_conf)
++        lvs = lvm._get_lvs_of_vg('sys')
++        self.assertEqual(bitmath.Byte(19000001024),
++                         lvm._get_lvs_size_in_bytes(lvs))
++
++    @mock.patch.object(LvmSetup, '_get_pvs_size_in_bytes')
++    @mock.patch('ironic_lib.system_installer.tools.get_memsize_kB')
++    def test_validate_lvm_size(self, mem, exe):
++        exe.return_value = 20401095680
++        mem.return_value = '1'
++        self.lvm.validate_lvm_size(self.devices)
++
++    @mock.patch.object(LvmSetup, '_get_pvs_size_in_bytes')
++    @mock.patch('ironic_lib.system_installer.tools.get_memsize_kB')
++    def test_validate_lvm_size_fails(self, mem, exe):
++        exe.return_value = 2040
++        mem.return_value = '1'
++        with self.assertRaises(exceptions.ConfError):
++            self.lvm.validate_lvm_size(self.devices)
++
++    def test_get_src_names(self):
++        self.assertListEqual(self.lvm.get_src_names(), ["d0p2"])
++
++    def test_get_vg_names(self):
++        self.assertListEqual(self.lvm._get_vg_names(), ['sys'])
++
++    def test_get_pv_of_vg(self):
++        self.assertListEqual(self.lvm._get_pvs_of_vg('sys', self.devices),
++                             ['/dev/sda'])
++
++    def test_get_lvs_of_vg(self):
++        lvs = {'home': {'minsize': '1G'},
++               'root': {'size': '10G'},
++               'swap': {'size': 'memsize'},
++               'var': {'size': '4G'},
++               'tmp': {'size': '4G'}}
++        self.assertDictEqual(self.lvm._get_lvs_of_vg('sys'), lvs)
++
++    @mock.patch('subprocess.check_call')
++    def test_create_lv(self, exe):
++        self.assertEqual(self.lvm._create_lv("home", "sys", "4G"),
++                         "/dev/sys/home")
++        exe.assert_any_call(['lvcreate', '-L', '4G', '-y', '-Wy', '-Zy',
++                             '-n', 'home', 'sys'])
++
++    @mock.patch('subprocess.check_call')
++    def test_create_lv_minsize(self, exe):
++        self.assertEqual(self.lvm._create_lv("home", "sys", "100", True),
++                         "/dev/sys/home")
++        exe.assert_any_call(['lvcreate', '-l', '100%FREE', '-y', '-Wy', '-Zy',
++                             '-n', 'home',
++                             'sys'])
++
++    @mock.patch.object(LvmSetup, '_get_lvs')
++    @mock.patch('subprocess.check_call')
++    @mock.patch('ironic_lib.system_installer.tools.get_memsize_kB')
++    def test_create_lvs(self, mem, exe, lvs):
++        lvs.return_value = []
++        mem.return_value = '32825036'
++        created_lvs = {"home": "/dev/sys/home", "root": "/dev/sys/root",
++                       "swap": "/dev/sys/swap", "var": "/dev/sys/var",
++                       "tmp": "/dev/sys/tmp"}
++        self.assertEqual(self.lvm._create_lvs('sys'), created_lvs)
++
++        exe.assert_any_call(['lvcreate', '-l', '100%FREE', '-y', '-Wy', '-Zy',
++                             '-n', 'home',
++                             'sys'])
++        exe.assert_any_call(['lvcreate', '-L', '10G', '-y', '-Wy', '-Zy',
++                             '-n', 'root', 'sys'])
++        exe.assert_any_call(['lvcreate', '-L', '32825036K', '-y', '-Wy', '-Zy',
++                             '-n', 'swap',
++                             'sys'])
++        exe.assert_any_call(['lvcreate', '-L', '4G', '-y', '-Wy', '-Zy',
++                             '-n', 'var', 'sys'])
++        exe.assert_any_call(['lvcreate', '-L', '4G', '-y', '-Wy', '-Zy',
++                             '-n', 'tmp', 'sys'])
++
++    @mock.patch.object(LvmSetup, '_get_pvs')
++    @mock.patch('subprocess.check_call')
++    def test_create_pvs_no_existing(self, exe, pvs):
++        pvs.return_value = []
++        self.lvm._create_pvs('sys', self.devices)
++        exe.assert_any_call(['pvcreate', '-ff', '/dev/sda'])
++
++    @mock.patch.object(LvmSetup, '_get_pvs')
++    @mock.patch('subprocess.check_call')
++    def test_create_omit_pvs_existing_pv(self, exe, pvs):
++        pvs.return_value = ['/dev/sys/root', '/dev/sys/home']
++        self.lvm._create_pvs('sys', self.devices)
++
++    @mock.patch.object(LvmSetup, '_get_pvs')
++    @mock.patch('subprocess.check_call')
++    def test_create_pvs_not_for_all_devices(self, exe, pvs):
++        pvs.return_value = []
++        lvm = LvmSetup({
++            'lvm': {
++                'foo': {'LVs': {'home': {'minsize': '1G'}},
++                        'PVs': ['d0p2']}
++            }
++        })
++        devices = {"d0p2": "/dev/sda", "d0p1": "/dev/sdb"}
++        vg = 'foo'
++        lvm._create_pvs(vg, devices)
++        exe.assert_called_once_with(['pvcreate', '-ff', '/dev/sda'])
++
++    @mock.patch.object(LvmSetup, '_get_vgs')
++    @mock.patch('subprocess.check_call')
++    def test_create_vg_no_existing_vgs(self, exe, vgs):
++        vgs.return_value = []
++        self.lvm._create_vg('sys', self.devices)
++        exe.assert_any_call(['vgcreate', '-y', 'sys', '/dev/sda'])
++
++    @mock.patch.object(LvmSetup, '_get_vgs')
++    @mock.patch('subprocess.check_call')
++    def test_create_vg_omit_existing(self, exe, vgs):
++        vgs.return_value = ['fedora']
++        self.lvm._create_vg('fedora', self.devices)
++        exe.assert_not_called()
++
++    @mock.patch.object(LvmSetup, '_get_lvs')
++    @mock.patch.object(LvmSetup, '_get_vgs')
++    @mock.patch.object(LvmSetup, '_get_pvs')
++    @mock.patch.object(LvmSetup, 'validate_lvm_size')
++    @mock.patch('subprocess.check_call')
++    @mock.patch('subprocess.check_output')
++    @mock.patch('ironic_lib.system_installer.tools.get_memsize_kB')
++    def test_setup_disks(self, mem, output, call, val, pvs, vgs, lvs):
++        lvs.return_value = []
++        vgs.return_value = []
++        pvs.return_value = []
++        with open('ironic_lib/tests/examples/example2.yml') as f:
++            conf = yaml.load(f)
++        devices = self.devices = {"d0p2": "/dev/sda", "d0p1": "/dev/sdb"}
++        mem.return_value = '32K'
++        lvm = LvmSetup(conf['disk_config'])
++        out = lvm.setup_disks(devices)
++        expected = {'root': '/dev/sys/root', 'home': '/dev/sys/home',
++                    'tmp': '/dev/tmp/tmp', 'd0p2': '/dev/sda',
++                    'd0p1': '/dev/sdb'}
++        self.assertEqual(out, expected)
++
++    @mock.patch('subprocess.check_output')
++    def test_get_vgs(self, exe):
++        output = """{
++            "report": [
++                {
++                    "vg": [
++                        {"vg_name":"fedora", "pv_count":"1", "lv_count":"2",
++                        "snap_count":"0", "vg_attr":"wz--n-",
++                        "vg_size":"371.41g", "vg_free":"0 "}
++                    ]
++                }
++            ]
++        }"""
++
++        exe.return_value = output
++        self.assertEqual(['fedora'], self.lvm._get_vgs())
++
++    @mock.patch('subprocess.check_output')
++    def test_get_vgs_empty(self, exe):
++        output = """{
++            "report": [
++                {
++                    "vg": [
++                    ]
++                }
++            ]
++        }"""
++
++        exe.return_value = output
++        self.assertEqual([], self.lvm._get_vgs())
++
++    @mock.patch.object(LvmSetup, 'validate_lvm_size')
++    @mock.patch.object(LvmSetup, '_create_pvs')
++    @mock.patch.object(LvmSetup, '_create_vg')
++    @mock.patch.object(LvmSetup, '_create_lvs')
++    def test_setup_disks_lvm_not_from_all_disks(self, lvs, vg, pvs, val):
++        devices = {'d0p1': '/dev/sda1', 'd0p2': '/dev/sda2'}
++        lvs.return_value = {'var': '/dev/sys/var',
++                            'tmp': '/dev/sys/tmp',
++                            'root': '/dev/sys/root',
++                            'swap': '/dev/sys/swap',
++                            'home': '/dev/sys/home'}
++        self.assertEqual({'d0p1': '/dev/sda1',
++                          'd0p2': '/dev/sda2',
++                          'var': '/dev/sys/var',
++                          'tmp': '/dev/sys/tmp',
++                          'root': '/dev/sys/root',
++                          'swap': '/dev/sys/swap',
++                          'home': '/dev/sys/home'},
++                         self.lvm.setup_disks(devices))
++
++    @mock.patch('subprocess.check_output')
++    def test_get_pvs(self, exe):
++        output = """{
++            "report": [
++                {
++                    "pv": [
++                        {"pv_name":"/dev/sda1", "vg_name":"sys",
++                         "pv_fmt":"lvm2", "pv_attr":"a--",
++                         "pv_size":"484.00m", "pv_free":"0 "},
++                        {"pv_name":"/dev/sda2", "vg_name":"sys",
++                         "pv_fmt":"lvm2", "pv_attr":"a--", "pv_size":"1.09t",
++                         "pv_free":"0 "}
++                    ]
++                }
++            ]
++        }"""
++
++        exe.return_value = output
++        self.assertEqual(['/dev/sda1', '/dev/sda2'], self.lvm._get_pvs())
++
++    @mock.patch('subprocess.check_output')
++    def test_get_pvs_empty(self, exe):
++        output = """{
++            "report": [
++                {
++                    "pv": [
++                    ]
++                }
++            ]
++        }"""
++
++        exe.return_value = output
++        self.assertEqual([], self.lvm._get_pvs())
++
++    @mock.patch('subprocess.check_output')
++    def test_get_lvs(self, exe):
++        output = """{
++            "report": [
++                {
++                    "lv": [
++                        {"lv_name":"home", "vg_name":"fedora",
++                         "lv_attr":"-wi-ao----",
++                         "lv_size":"<231.11g", "pool_lv":"",
++                         "origin":"", "data_percent":"", "metadata_percent":"",
++                         "move_pv":"", "mirror_log":"", "copy_percent":"",
++                         "convert_lv":""},
++                        {"lv_name":"root", "vg_name":"fedora",
++                         "lv_attr":"-wi-ao----", "lv_size":"140.30g",
++                         "pool_lv":"", "origin":"", "data_percent":"",
++                         "metadata_percent":"", "move_pv":"",
++                         "mirror_log":"", "copy_percent":"", "convert_lv":""}
++                    ]
++                }
++            ]
++        }"""
++
++        exe.return_value = output
++        self.assertEqual(['/dev/fedora/home', '/dev/fedora/root'],
++                         self.lvm._get_lvs())
++
++    @mock.patch('subprocess.check_output')
++    def test_get_lvs_empty(self, exe):
++        output = """{
++            "report": [
++                {
++                    "lv": [
++                    ]
++                }
++            ]
++        }"""
++
++        exe.return_value = output
++        self.assertEqual([], self.lvm._get_lvs())
++
++    @mock.patch('subprocess.check_call')
++    def test_remove_lvs(self, exe):
++        lvs = ['test']
++        self.lvm._remove_lvs(lvs)
++        exe.assert_called_once_with(['lvremove', '-y', 'test'])
++
++    @mock.patch('subprocess.check_call')
++    def test_remove_vgs(self, exe):
++        vgs = ['test']
++        self.lvm._remove_vgs(vgs)
++        exe.assert_called_once_with(['vgremove', '-y', 'test'])
++
++    @mock.patch('subprocess.check_call')
++    def test_remove_pvs(self, exe):
++        pvs = ['test']
++        self.lvm._remove_pvs(pvs)
++        exe.assert_called_once_with(['pvremove', '-y', 'test'])
++
++    @mock.patch.object(LvmSetup, '_get_empty_vgs')
++    @mock.patch.object(LvmSetup, '_get_empty_pvs')
++    @mock.patch.object(LvmSetup, '_remove_lvs')
++    @mock.patch.object(LvmSetup, '_get_lvs')
++    def test_clean_disks_no_preserve(self, lvs, remove_lvs,
++                                     empty_pvs, empty_vgs):
++        empty_vgs.return_value([])
++        empty_pvs.return_value([])
++        lvs.return_value = ['/dev/sys/home', '/dev/sys2/root']
++        excluded_devices = {}
++        self.lvm.clean_disks(excluded_devices)
++        remove_lvs.assert_called_once_with(['/dev/sys/home', '/dev/sys2/root'])
++
++    @mock.patch.object(LvmSetup, '_get_empty_vgs')
++    @mock.patch.object(LvmSetup, '_get_empty_pvs')
++    @mock.patch.object(LvmSetup, '_remove_lvs')
++    @mock.patch.object(LvmSetup, '_get_lvs')
++    def test_clean_disks_preserve_lv(self, lvs, remove_lvs,
++                                     empty_pvs, empty_vgs):
++        empty_vgs.return_value([])
++        empty_pvs.return_value([])
++        lvs.return_value = ['/dev/sys/home', '/dev/sys2/root']
++        excluded_devices = {'home': '/dev/sys/home'}
++        self.lvm.clean_disks(excluded_devices)
++        remove_lvs.assert_called_once_with(['/dev/sys2/root'])
++
++    @mock.patch('subprocess.check_call')
++    def test_is_dev_lv_true(self, call):
++        device = '/dev/sys/home'
++        self.assertTrue(self.lvm._is_dev_lv(device))
++
++    @mock.patch('subprocess.check_call')
++    def test_ist_dev_lv_false(self, call):
++        call.side_effect = subprocess.CalledProcessError(5, 'lvdisplay')
++        device = '/dev/sda'
++        self.assertFalse(self.lvm._is_dev_lv(device))
++
++    @mock.patch('subprocess.check_output')
++    def test_get_empty_vgs(self, exe):
++        vgs_output = """{
++            "report": [
++                {
++                    "vg": [
++                        {"vg_name": "sys", "pv_count": "2", "lv_count": "5",
++                         "snap_count": "0", "vg_attr": "wz--n-",
++                         "vg_size": "1.09t", "vg_free": "0 "},
++                        {"vg_name": "sys2", "pv_count": "2", "lv_count": "0",
++                         "snap_count": "0", "vg_attr": "wz--n-",
++                         "vg_size": "1.09t", "vg_free": "0 "}
++                    ]
++                }
++            ]
++        }"""
++        exe.return_value = vgs_output
++        self.assertEqual(self.lvm._get_empty_vgs(), ['sys2'])
++
++    @mock.patch('subprocess.check_output')
++    def test_get_empty_vgs_no_existing_vgs(self, exe):
++        vgs_output = """{
++            "report": [
++                {
++                    "vg": [
++                    ]
++                }
++            ]
++        }"""
++
++        exe.return_value = vgs_output
++        self.assertEqual(self.lvm._get_empty_vgs(), [])
++
++    @mock.patch('subprocess.check_output')
++    def test_get_empty_pvs(self, exe):
++        pvs_output = """{
++            "report": [
++                {
++                    "pv": [
++                        {"pv_name":"/dev/sda1", "vg_name":"sys",
++                        "pv_fmt":"lvm2", "pv_attr":"---", "pv_size":"488.00m",
++                        "pv_free":"488.00m"},
++                        {"pv_name":"/dev/sda2", "vg_name":"", "pv_fmt":"lvm2",
++                        "pv_attr":"---", "pv_size":"1.09t", "pv_free":"1.09t"}
++                    ]
++                }
++            ]
++        }"""
++
++        exe.return_value = pvs_output
++        self.assertEqual(self.lvm._get_empty_pvs(), ['/dev/sda2'])
++
++    @mock.patch('subprocess.check_output')
++    def test_get_empty_pvs_no_existing_pvs(self, exe):
++        pvs_output = """{
++            "report": [
++                {
++                    "pv": [
++                    ]
++                }
++            ]
++        }"""
++
++        exe.return_value = pvs_output
++        self.assertEqual(self.lvm._get_empty_pvs(), [])
+-- 
+2.16.2
+
