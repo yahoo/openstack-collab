@@ -1,0 +1,217 @@
+From b5dbba0381c9b837eec18c5cdba9a08fb979212c Mon Sep 17 00:00:00 2001
+From: "Grzegorz Grasza (xek)" <grzegorz.grasza@intel.com>
+Date: Fri, 12 Jan 2018 10:48:48 +0100
+Subject: [PATCH 4/6] Software RAID setup implementation
+
+Co-Authored-By: Grzegorz Grasza <grzegorz.grasza@intel.com>
+---
+ disk_partitioner/swraidsetup.py | 88 ++++++++++++++++++++++++++++++++++++++++
+ tests/test_swraidsetup.py       | 89 +++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 177 insertions(+)
+ create mode 100644 tests/test_swraidsetup.py
+
+diff --git a/disk_partitioner/swraidsetup.py b/disk_partitioner/swraidsetup.py
+index 7bd73bb..f846798 100644
+--- a/disk_partitioner/swraidsetup.py
++++ b/disk_partitioner/swraidsetup.py
+@@ -1,4 +1,12 @@
++from ironic_python_agent import errors, utils
++from oslo_concurrency import processutils
++from oslo_log import log
++
+ from .base import Setup
++from .exceptions import ConfError
++
++
++LOG = log.getLogger()
+ 
+ 
+ class SwRaidSetup(Setup):
+@@ -6,9 +14,89 @@ class SwRaidSetup(Setup):
+ 
+     conf_key = 'swraid'
+ 
++    def validate_conf(self):
++        for raid in self.conf.values():
++            disks = len(raid['partitions'])
++            raid = raid['raidtype']
++            if (raid == 0 and (disks == 0 or (disks % 2))) \
++               or (raid == 1 and disks < 2) \
++               or (raid in (4, 5) and disks < 3) \
++               or (raid == 6 and disks < 4):
++                raise ConfError(
++                    "Wrong amount of disks for SW RAID {}.".format(raid))
++
+     def get_src_names(self):
+         raid_partitions = [r['partitions'] for r in self.conf.values()]
+         return sum(raid_partitions, [])
+ 
+     def get_dst_names(self):
+         return list(self.conf)
++
++    def setup_disks(self, devices):
++        """ Create RAID configuration on the bare metal. """
++        for name, conf in self.conf.items():
++            partitions = [devices.get(p, p) for p in conf['partitions']]
++            out, err = utils.execute(
++                "yes | mdadm --create /dev/{name} --level={raidtype} "
++                "--raid-devices={number} {partitions} --force".format(
++                    name=name, raidtype=conf['raidtype'],
++                    number=len(partitions), partitions=' '.join(partitions)),
++                shell=True)
++
++            LOG.debug("Debug create stdout: {}".format(out))
++            LOG.debug("Debug create stderr: {}".format(err))
++            devices[name] = '/dev/'+name
++        return devices
++
++    def _clean(self):
++        """ Deletes all RAID configuration (from CERN hardware-manager). """
++        raid_devices, _ = utils.execute("cat /proc/mdstat | grep 'active raid'"
++                                        "| awk '{ print $1 }'", shell=True)
++
++        for device in ['/dev/' + x for x in raid_devices.split()]:
++            try:
++                component_devices, err = utils.execute(
++                    "mdadm --detail {} | grep 'active sync' "
++                    "| awk '{{ print $7 }}'".format(device), shell=True)
++                LOG.info("Component devices for {}: {}".format(
++                    device, component_devices))
++
++                if err:
++                    raise processutils.ProcessExecutionError(err)
++            except (processutils.ProcessExecutionError, OSError) as e:
++                raise errors.CleaningError(
++                    "Error getting details of RAID device {}. {}".format(
++                        device, e))
++
++            try:
++                # Positive output of the following goes into stderr, thus
++                # we don't want to check its content
++                utils.execute("mdadm --stop {}".format(device), shell=True)
++
++            except (processutils.ProcessExecutionError, OSError) as e:
++                raise errors.CleaningError(
++                    "Error stopping RAID device {}. {}".format(device, e))
++
++            try:
++                utils.execute("mdadm --remove {}".format(device), shell=True)
++            except processutils.ProcessExecutionError:
++                # After successful stop this returns
++                # "mdadm: error opening /dev/md3: No such file or directory"
++                # with error code 1, which we can safely ignore
++                pass
++
++            for device in component_devices.split():
++                try:
++                    _, err = utils.execute("mdadm --examine {}".format(device),
++                                           shell=True)
++                    if "No md superblock detected" in err:
++                        continue
++
++                    _, err = utils.execute("mdadm --zero-superblock {}".format(
++                        device), shell=True)
++                    if err:
++                        raise processutils.ProcessExecutionError(err)
++                except (processutils.ProcessExecutionError, OSError) as e:
++                    raise errors.CleaningError(
++                        "Error erasing superblock for device {}. {}".format(
++                            device, e))
+diff --git a/tests/test_swraidsetup.py b/tests/test_swraidsetup.py
+new file mode 100644
+index 0000000..e286205
+--- /dev/null
++++ b/tests/test_swraidsetup.py
+@@ -0,0 +1,89 @@
++from collections import OrderedDict
++
++import pytest
++from pytest_mock import mocker as _mocker  # noqa: F401, install fixtures
++
++from disk_partitioner.swraidsetup import SwRaidSetup, ConfError
++
++
++def test_validate_conf():
++    swraid_setup = SwRaidSetup(
++        {'swraid': {'md0': {
++            'raidtype': 1,
++            'partitions': ['d0p1', 'd0p2']
++        },
++         'md1': {
++             'raidtype': 2,
++             'partitions': ['d1p1', 'd1p2']
++         }}})
++    swraid_setup.validate_conf()
++
++
++def test_validate_conf_error():
++    swraid_setup = SwRaidSetup(
++        {'swraid': {'md0': {
++            'raidtype': 4,
++            'partitions': ['d0p1', 'd0p2']
++        }}})
++    with pytest.raises(ConfError):
++        swraid_setup.validate_conf()
++
++    swraid_setup = SwRaidSetup(
++        {'swraid': {'md1': {
++            'raidtype': 6,
++            'partitions': ['d1p1', 'd1p2', 'd1p2']
++        }}})
++    with pytest.raises(ConfError):
++        swraid_setup.validate_conf()
++
++
++def test_get_src_names():
++    swraid_setup = SwRaidSetup(
++        {'swraid': {'md0': {
++            'raidtype': 1,
++            'partitions': ['d0p1', 'd0p2']
++        },
++         'md1': {
++             'raidtype': 1,
++             'partitions': ['d1p1', 'd1p2']
++         }}})
++    assert set(swraid_setup.get_src_names()) == \
++        set(['d0p1', 'd0p2', 'd1p1', 'd1p2'])
++
++
++def test_get_dst_names():
++    swraid_setup = SwRaidSetup(
++        {'swraid': {'md0': {
++            'raidtype': 1,
++            'partitions': ['d0p1', 'd0p2']
++        },
++         'md1': {
++             'raidtype': 1,
++             'partitions': ['d1p1', 'd1p2']
++         }}})
++    assert set(swraid_setup.get_dst_names()) == \
++        set(['md0', 'md1'])
++
++
++def test_setup_disks(mocker):
++    exe_mock = mocker.patch('ironic_lib.utils.execute', return_value=('', ''))
++
++    swraid_setup = SwRaidSetup({'swraid': OrderedDict([
++        ('md0', {
++            'raidtype': 1,
++            'partitions': ['d0p1', 'd0p2']
++        }),
++        ('md1', {
++            'raidtype': 2,
++            'partitions': ['d1p1', 'd1p2']
++        })])})
++    result = swraid_setup.setup_disks({})
++    assert result == {'md0': '/dev/md0', 'md1': '/dev/md1'}
++    exe_mock.assert_any_call(
++        'yes | '
++        'mdadm --create /dev/md0 --level=1 --raid-devices=2 d0p1 d0p2 --force',
++        shell=True)
++    exe_mock.assert_any_call(
++        'yes | '
++        'mdadm --create /dev/md1 --level=2 --raid-devices=2 d1p1 d1p2 --force',
++        shell=True)
+-- 
+2.11.0
+
