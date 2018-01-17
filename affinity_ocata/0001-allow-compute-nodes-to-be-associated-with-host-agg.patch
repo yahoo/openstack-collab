@@ -1,30 +1,28 @@
-From cc4070f78b764af439b429908a97f82e620803c9 Mon Sep 17 00:00:00 2001
+From 0f820a60994586debef47a59ebf8d9eef225b69c Mon Sep 17 00:00:00 2001
 From: Roman Dobosz <roman.dobosz@intel.com>
 Date: Wed, 27 Dec 2017 13:51:25 +0100
-Subject: [PATCH] allow compute nodes to be associated with host agg
+Subject: [PATCH 1/3] allow compute nodes to be associated with host agg
 
 This is basically an Ocata backport patch from Jay Pipes:
 https://review.openstack.org/#/c/526753
 ---
- nova/compute/api.py                                |  37 +++++-
+ nova/compute/api.py                                |  36 +++++-
  nova/tests/functional/compute/__init__.py          |   0
- .../tests/functional/compute/test_aggregate_api.py | 139 +++++++++++++++++++++
- nova/tests/unit/compute/test_compute.py            |   4 +-
- 4 files changed, 174 insertions(+), 6 deletions(-)
+ .../tests/functional/compute/test_aggregate_api.py | 127 +++++++++++++++++++++
+ 3 files changed, 159 insertions(+), 4 deletions(-)
  create mode 100644 nova/tests/functional/compute/__init__.py
  create mode 100644 nova/tests/functional/compute/test_aggregate_api.py
 
 diff --git a/nova/compute/api.py b/nova/compute/api.py
-index 36de3abc34..b064f26a45 100644
+index 6f1371b45f..39437e6c16 100644
 --- a/nova/compute/api.py
 +++ b/nova/compute/api.py
-@@ -4540,6 +4540,32 @@ class AggregateAPI(base.Base):
+@@ -4548,6 +4548,31 @@ class AggregateAPI(base.Base):
              availability_zones.update_host_availability_zone_cache(context,
                                                                     host_name)
  
 +    def _service_or_compute_node_exists(self, ctx, host_or_node):
-+        """
-+        Returns True if a service host or compute node record could be found
++        """Returns True if a service host or compute node record could be found
 +        for the supplied host_or_node string. We first check to see if a
 +        service record can be found with the host matching the host_or_node
 +        parameter by looking at the host mapping records in the API database.
@@ -36,7 +34,7 @@ index 36de3abc34..b064f26a45 100644
 +        try:
 +            objects.Service.get_by_compute_host(ctx, host_or_node)
 +            return True
-+        except exception.HostMappingNotFound:
++        except exception.ComputeHostNotFound:
 +            pass
 +
 +        found_nodes = (len(objects.ComputeNodeList
@@ -51,7 +49,7 @@ index 36de3abc34..b064f26a45 100644
      @wrap_exception()
      def add_host_to_aggregate(self, context, aggregate_id, host_name):
          """Adds the host to an aggregate."""
-@@ -4548,8 +4574,9 @@ class AggregateAPI(base.Base):
+@@ -4556,8 +4581,9 @@ class AggregateAPI(base.Base):
          compute_utils.notify_about_aggregate_update(context,
                                                      "addhost.start",
                                                      aggregate_payload)
@@ -63,7 +61,7 @@ index 36de3abc34..b064f26a45 100644
  
          aggregate = objects.Aggregate.get_by_id(context, aggregate_id)
          self.is_safe_to_update_az(context, aggregate.metadata,
-@@ -4575,8 +4602,10 @@ class AggregateAPI(base.Base):
+@@ -4583,8 +4609,10 @@ class AggregateAPI(base.Base):
          compute_utils.notify_about_aggregate_update(context,
                                                      "removehost.start",
                                                      aggregate_payload)
@@ -81,10 +79,10 @@ new file mode 100644
 index 0000000000..e69de29bb2
 diff --git a/nova/tests/functional/compute/test_aggregate_api.py b/nova/tests/functional/compute/test_aggregate_api.py
 new file mode 100644
-index 0000000000..aeaf3958f2
+index 0000000000..7946fddcfe
 --- /dev/null
 +++ b/nova/tests/functional/compute/test_aggregate_api.py
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,127 @@
 +# Licensed under the Apache License, Version 2.0 (the "License"); you may
 +# not use this file except in compliance with the License. You may obtain
 +# a copy of the License at
@@ -118,9 +116,7 @@ index 0000000000..aeaf3958f2
 +        self.agg_api = compute_api.AggregateAPI()
 +        self.useFixture(nova_fixtures.Database(database='api'))
 +        celldbs = nova_fixtures.CellDatabases()
-+        celldbs.add_cell_database(objects.CellMapping.CELL0_UUID)
-+        celldbs.add_cell_database(uuids.cell1, default=True)
-+        celldbs.add_cell_database(uuids.cell2)
++        celldbs.add_cell_database(objects.CellMapping.CELL0_UUID, default=True)
 +        self.useFixture(celldbs)
 +
 +        self.ctxt = context.get_admin_context()
@@ -129,40 +125,31 @@ index 0000000000..aeaf3958f2
 +            database_connection=objects.CellMapping.CELL0_UUID,
 +            transport_url='none:///')
 +        cell0.create()
-+        cell1 = objects.CellMapping(
-+            context=self.ctxt, uuid=uuids.cell1,
-+            database_connection=uuids.cell1, transport_url='none:///')
-+        cell1.create()
-+        cell2 = objects.CellMapping(
-+            context=self.ctxt, uuid=uuids.cell2,
-+            database_connection=uuids.cell2, transport_url='none:///')
-+        cell2.create()
-+        self.cell_mappings = (cell0, cell1, cell2)
++        self.cell_mappings = (cell0,)
 +
-+        # create two Ironic nodes managed by a single nova-compute service host
-+        # in each of the non-cell0 cells
-+        for cell_id, cell in enumerate(self.cell_mappings[1:]):
-+            with context.target_cell(self.ctxt, cell) as cctxt:
-+                hostname = 'ironic_host_cell%s' % (cell_id + 1)
++        # create two Ironic nodes
++        for id_ in (1, 2):
++            hostname = 'ironic_host_%s' % id_
++            with context.target_cell(self.ctxt, cell0) as cctxt:
 +                svc = objects.Service(cctxt, host=hostname,
 +                                      binary='nova-compute',
 +                                      topic='nova-compute')
 +                svc.create()
-+                for node_id in (1, 2):
-+                    nodename = 'ironic_node_cell%s_%s' % (cell_id + 1, node_id)
-+                    compute_node_uuid = getattr(uuids, nodename)
-+                    node = objects.ComputeNode(
-+                        cctxt, uuid=compute_node_uuid, host=hostname,
-+                        vcpus=2, memory_mb=2048, local_gb=128, vcpus_used=0,
-+                        memory_mb_used=0, local_gb_used=0, cpu_info='{}',
-+                        hypervisor_type='ironic', hypervisor_version=10,
-+                        hypervisor_hostname=nodename)
-+                    node.create()
++
++            nodename = 'ironic_node_%s' % id_
++            compute_node_uuid = getattr(uuids, nodename)
++            node = objects.ComputeNode(
++                cctxt, uuid=compute_node_uuid, host=hostname,
++                vcpus=2, memory_mb=2048, local_gb=128, vcpus_used=0,
++                memory_mb_used=0, local_gb_used=0, cpu_info='{}',
++                hypervisor_type='ironic', hypervisor_version=10,
++                hypervisor_hostname=nodename)
++            node.create()
 +
 +        # create a compute node for VMs along with a corresponding nova-compute
 +        # service host in cell1
-+        with context.target_cell(self.ctxt, cell1) as cctxt:
-+            hostname = 'vm_host_cell1_1'
++        with context.target_cell(self.ctxt, cell0) as cctxt:
++            hostname = 'vm_host_1'
 +            svc = objects.Service(cctxt, host=hostname,
 +                                  binary='nova-compute',
 +                                  topic='nova-compute')
@@ -194,7 +181,7 @@ index 0000000000..aeaf3958f2
 +                          self.agg_api.remove_host_from_aggregate, self.ctxt,
 +                          agg_id, 'unknown_host_cell1')
 +
-+        hosts = ('ironic_host_cell1', 'ironic_host_cell2', 'vm_host_cell1_1')
++        hosts = ('ironic_host_1', 'vm_host_1')
 +        for service_host in hosts:
 +            self.agg_api.add_host_to_aggregate(self.ctxt, agg_id, service_host)
 +            self.agg_api.remove_host_from_aggregate(self.ctxt, agg_id,
@@ -218,30 +205,11 @@ index 0000000000..aeaf3958f2
 +                          self.agg_api.remove_host_from_aggregate, self.ctxt,
 +                          agg_id, getattr(uuids, 'unknown_host_cell1'))
 +
-+        nodenames = ('ironic_node_cell1_2', 'ironic_node_cell2_1',
-+                 'vm_host_cell1_1')
++        nodenames = ('ironic_node_2', 'ironic_node_1', 'vm_host_')
 +        for nodename in nodenames:
 +            self.agg_api.add_host_to_aggregate(self.ctxt, agg_id, nodename)
 +            self.agg_api.remove_host_from_aggregate(self.ctxt, agg_id,
 +                                                    nodename)
-diff --git a/nova/tests/unit/compute/test_compute.py b/nova/tests/unit/compute/test_compute.py
-index a71f337eb5..a1c26d6e4d 100644
---- a/nova/tests/unit/compute/test_compute.py
-+++ b/nova/tests/unit/compute/test_compute.py
-@@ -11193,11 +11193,11 @@ class ComputeAPIAggrTestCase(BaseTestCase):
-         mock_az.assert_called_with(self.context, host_to_remove)
- 
-     def test_remove_host_from_aggregate_raise_not_found(self):
--        # Ensure ComputeHostNotFound is raised when removing invalid host.
-+        # Ensure HostMappingNotFound is raised when removing invalid host.
-         _create_service_entries(self.context, [['fake_zone', ['fake_host']]])
-         aggr = self.api.create_aggregate(self.context, 'fake_aggregate',
-                                          'fake_zone')
--        self.assertRaises(exception.ComputeHostNotFound,
-+        self.assertRaises(exception.HostMappingNotFound,
-                           self.api.remove_host_from_aggregate,
-                           self.context, aggr.id, 'invalid_host')
- 
 -- 
 2.13.6
 
