@@ -1,16 +1,16 @@
-From 1374f28766d56361b9342d77a32c0e52034060f1 Mon Sep 17 00:00:00 2001
+From 69d0e023edfc2edc123fd5ed29b79ebbd3abe97f Mon Sep 17 00:00:00 2001
 From: Roman Dobosz <roman.dobosz@intel.com>
 Date: Wed, 10 Jan 2018 10:37:54 +0100
-Subject: [PATCH 3/3] get instance group's aggregate associations
+Subject: [PATCH 3/4] get instance group's aggregate associations
 
 Ocata backport for patch from Jay Pipes:
 https://review.openstack.org/#/c/531243/
 ---
  nova/objects/instance_group.py                  |  36 +++++++-
- nova/tests/functional/db/test_instance_group.py | 112 ++++++++++++++++++++++++
+ nova/tests/functional/db/test_instance_group.py | 116 ++++++++++++++++++++++++
  nova/tests/unit/objects/test_instance_group.py  |  21 +++++
  nova/tests/unit/objects/test_objects.py         |   2 +-
- 4 files changed, 169 insertions(+), 2 deletions(-)
+ 4 files changed, 173 insertions(+), 2 deletions(-)
 
 diff --git a/nova/objects/instance_group.py b/nova/objects/instance_group.py
 index 670813b77e..2be47278b2 100644
@@ -74,7 +74,7 @@ index 670813b77e..2be47278b2 100644
          """Count the number of instances in a group belonging to a user."""
          filter_uuids = self.members
 diff --git a/nova/tests/functional/db/test_instance_group.py b/nova/tests/functional/db/test_instance_group.py
-index 4c4f627fe2..445ae655cc 100644
+index 4c4f627fe2..b4c7ef3fd8 100644
 --- a/nova/tests/functional/db/test_instance_group.py
 +++ b/nova/tests/functional/db/test_instance_group.py
 @@ -18,6 +18,7 @@ from nova.db.sqlalchemy import api as db_api
@@ -85,7 +85,7 @@ index 4c4f627fe2..445ae655cc 100644
  from nova.objects import instance_group
  from nova import test
  from nova.tests import uuidsentinel as uuids
-@@ -238,3 +239,114 @@ class InstanceGroupObjectTestCase(test.TestCase):
+@@ -238,3 +239,118 @@ class InstanceGroupObjectTestCase(test.TestCase):
                          self.context, 100)
          self.assertEqual(0, total)
          self.assertEqual(0, done)
@@ -144,8 +144,12 @@ index 4c4f627fe2..445ae655cc 100644
 +        agg2 = objects.Aggregate(self.ctx, name='agg2')
 +        agg2.create()
 +
-+        # NOTE(gryf): creating bare instances doesn't propagate project_id
-+        # for some reason, so that test would fail.
++        # NOTE(gryf): We are passing project_id explicitly, due to not going
++        # through all the process, like calling
++        # nova.compute.api.API._validate_and_build_base_options(), which
++        # return among other things base_options which contain project_id.
++        # We could do the i1.update({'project_id': ctx.project_id}) instead,
++        # but passing project_id as a parameter during object init is cleaner.
 +        i1 = objects.Instance(self.ctx, host='host1', node='node1',
 +                              project_id=self.ctx.project_id)
 +        i1.create()
