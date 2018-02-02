@@ -1,0 +1,133 @@
+From 3f55f13381630b5bd7da4431ca754eb50c8ae418 Mon Sep 17 00:00:00 2001
+From: PiotrProkop <piotr.prokop@intel.com>
+Date: Thu, 11 Jan 2018 13:34:44 +0100
+Subject: [PATCH] Bumping version of debian to stretch, adding user core to
+ coreos IPA image. Fixing script coreos-oem-inject.py to work on machines with
+ Python3 as default interpreter. Adding get_megacli.sh. Adding HP utils to IPA
+ image.
+
+---
+ Dockerfile                             | 27 ++++++++++++++++++++++-----
+ imagebuild/common/get_megacli.sh       | 16 ++++++++++++++++
+ imagebuild/coreos/coreos-oem-inject.py |  3 ++-
+ imagebuild/coreos/oem/cloud-config.yml |  7 +++++++
+ 4 files changed, 47 insertions(+), 6 deletions(-)
+ create mode 100755 imagebuild/common/get_megacli.sh
+
+diff --git a/Dockerfile b/Dockerfile
+index 8c7a56a..5aabc2b 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -1,4 +1,4 @@
+-FROM debian:jessie
++FROM debian:stretch
+ 
+ # The add is before the RUN to ensure we get the latest version of packages
+ # Docker will cache RUN commands, but because the SHA1 of the dir will be
+@@ -17,16 +17,30 @@ COPY proxy.sh /usr/bin/proxy.sh
+ RUN sed -i 's/httpredir/http.us/g' /etc/apt/sources.list
+ 
+ # Add 'backports' for qemu-utils
+-RUN echo 'deb http://http.us.debian.org/debian jessie-backports main' > /etc/apt/sources.list.d/backports.list
++RUN echo 'deb http://http.us.debian.org/debian stretch-backports main' > /etc/apt/sources.list.d/backports.list
++
++
++ENV DEBIAN_FRONTEND noninteractive
+ 
+ # Install requirements: Python for ironic-python-agent, others for putting an
+ # image on disk
+ RUN proxy.sh apt-get update && \
+     proxy.sh apt-get -y upgrade && \
+-    proxy.sh apt-get install -y --no-install-recommends gdisk python2.7 python2.7-dev \
++    proxy.sh apt-get install -y --no-install-recommends gdisk python2.7 python2.7-dev python2.7-setuptools \
+         python-pip qemu-utils parted hdparm util-linux genisoimage git gcc \
+-        bash coreutils tgt dmidecode ipmitool psmisc dosfstools && \
+-    proxy.sh apt-get --only-upgrade -t jessie-backports install -y qemu-utils
++        bash coreutils tgt dmidecode ipmitool psmisc dosfstools \
++        pciutils lvm2 udev mdadm wget unzip alien libguestfs-tools xfsprogs && \
++    proxy.sh apt-get install -y linux-image-amd64 gnupg2 && \
++    proxy.sh apt-get --only-upgrade -t stretch-backports install -y qemu-utils
++
++# Add HP repo
++RUN echo "deb http://downloads.linux.hpe.com/SDR/repo/mcp stretch/current non-free" > /etc/apt/sources.list.d/HP-mcp.list
++
++# Add GPG key for HP repo
++RUN curl http://downloads.linux.hpe.com/SDR/hpePublicKey2048_key1.pub | apt-key add -
++
++# Install ssacli
++RUN apt update && apt install -y ssacli
+ 
+ # Some cleanup
+ RUN proxy.sh apt-get -y autoremove && \
+@@ -44,6 +58,9 @@ RUN proxy.sh pip install -c /tmp/ironic-python-agent/upper-constraints.txt --no-
+ # This will succeed because all the dependencies were installed previously
+ RUN proxy.sh pip install -c /tmp/ironic-python-agent/upper-constraints.txt --no-cache-dir /tmp/ironic-python-agent
+ 
++# Install megacli
++RUN /tmp/ironic-python-agent/imagebuild/common/get_megacli.sh
++
+ # Remove no longer needed packages
+ # NOTE(jroll) leave git to avoid strange apt issues in downstream Dockerfiles
+ # that may inherit from this one.
+diff --git a/imagebuild/common/get_megacli.sh b/imagebuild/common/get_megacli.sh
+new file mode 100755
+index 0000000..90c7d57
+--- /dev/null
++++ b/imagebuild/common/get_megacli.sh
+@@ -0,0 +1,16 @@
++#!/usr/bin/env bash
++
++VERSION=${VERSION:-'8-07-14'}
++# replace - with .
++RPM_VERSION=${VERSION//\-/\.}
++# get MegaCli
++wget https://docs.broadcom.com/docs-and-downloads/raid-controllers/raid-controllers-common-files/${VERSION}_MegaCLI.zip
++# extract it
++unzip ${VERSION}_MegaCLI.zip -d megacli
++cd megacli/Linux
++#change to deb and install
++alien -k MegaCli-${RPM_VERSION}-1.noarch.rpm
++dpkg -i megacli_${RPM_VERSION}-1_all.deb
++# clean
++rm -rf $(dirname "$0")/${VERSION}_MegaCLI.zip
++rm -rf $(dirname "$0")/megacli/
+diff --git a/imagebuild/coreos/coreos-oem-inject.py b/imagebuild/coreos/coreos-oem-inject.py
+index 0c7a92e..a5ebb6a 100755
+--- a/imagebuild/coreos/coreos-oem-inject.py
++++ b/imagebuild/coreos/coreos-oem-inject.py
+@@ -1,4 +1,4 @@
+-#!/usr/bin/env python
++#!/usr/bin/env python2
+ 
+ #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+ #    not use this file except in compliance with the License. You may obtain
+@@ -29,6 +29,7 @@ def get_coreos_version(version_file, key='COREOS_VERSION_ID'):
+                 return line.strip().split("=")[1]
+     raise ValueError('Could not read CoreOS version number from file')
+ 
++
+ COREOS_VERSION_FILE = os.path.join(os.path.dirname(__file__), 'version.txt')
+ COREOS_VERSION = os.environ.get('COREOS_VERSION',
+                                 get_coreos_version(COREOS_VERSION_FILE))
+diff --git a/imagebuild/coreos/oem/cloud-config.yml b/imagebuild/coreos/oem/cloud-config.yml
+index 03f71ce..8e947f3 100644
+--- a/imagebuild/coreos/oem/cloud-config.yml
++++ b/imagebuild/coreos/oem/cloud-config.yml
+@@ -1,7 +1,14 @@
+ #cloud-config
+ 
++write_files:
++  - path: /etc/modules-load.d/nf.conf
++    content: sg
++
+ coreos:
+   units:
++    - name: systemd-modules-load.service
++      command: restart
++
+     - name: user-configdrive.service
+       mask: true
+ 
+-- 
+2.16.2
+
