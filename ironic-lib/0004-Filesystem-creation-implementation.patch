@@ -1,0 +1,489 @@
+From 4f94cd430c04626adcd6ccd761be87dac5c7d337 Mon Sep 17 00:00:00 2001
+From: "Grzegorz Grasza (xek)" <grzegorz.grasza@intel.com>
+Date: Thu, 11 Jan 2018 16:56:01 +0100
+Subject: [PATCH 04/11] Filesystem creation implementation
+
+Co-Authored-By: Grzegorz Grasza <grzegorz.grasza@intel.com>
+Co-Authored-By: Marta Mucek <marta.mucek@intel.com>
+---
+ ironic_lib/system_installer/filesystemsetup.py     | 139 +++++++++++++-
+ ironic_lib/tests/examples/example_efi.yaml         |  23 +++
+ .../examples/example_preserve_filesystem.yaml      |  47 +++++
+ ironic_lib/tests/test_examples.py                  |   4 +
+ ironic_lib/tests/test_filesystemsetup.py           | 205 +++++++++++++++++++++
+ 5 files changed, 415 insertions(+), 3 deletions(-)
+ create mode 100644 ironic_lib/tests/examples/example_efi.yaml
+ create mode 100644 ironic_lib/tests/examples/example_preserve_filesystem.yaml
+ create mode 100644 ironic_lib/tests/test_filesystemsetup.py
+
+diff --git a/ironic_lib/system_installer/filesystemsetup.py b/ironic_lib/system_installer/filesystemsetup.py
+index 6ed64d6..20040f8 100644
+--- a/ironic_lib/system_installer/filesystemsetup.py
++++ b/ironic_lib/system_installer/filesystemsetup.py
+@@ -13,7 +13,17 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import json
++import os
++import re
++
++from ironic_lib import utils
++from oslo_log import log
++
+ from ironic_lib.system_installer.base import Setup
++from ironic_lib.system_installer import exceptions
++
++LOG = log.getLogger()
+ 
+ 
+ class FilesystemSetup(Setup):
+@@ -30,14 +40,137 @@ class FilesystemSetup(Setup):
+                 return True
+         return False
+ 
++    def validate_conf(self):
++        if not self.get_boot_partition():
++            raise exceptions.ConfError(
++                'No boot partition found in provided config')
++
++    def validate_env(self):
++        for disk in self.conf.values():
++            fstype = disk.get('fstype', 'xfs')
++            if fstype != 'swap' and not self._cmd_exists('mkfs.' + fstype):
++                raise exceptions.EnvError('No mkfs.' + fstype)
++
++    def setup_disks(self, devices):
++        for disk_name, disk in self.conf.items():
++            fstype = disk.get('fstype', 'xfs')
++            device = devices.get(disk_name, disk_name)
++            if not disk.get('preserve', False):
++                if fstype == 'swap':
++                    out, err = utils.execute('mkswap', device)
++                else:
++                    if fstype in ['xfs', 'btrfs']:
++                        force = '-f'
++                    else:
++                        force = ''
++                    out, err = utils.execute(
++                        'yes | mkfs.{fstype} {force} {opts} {dev}'.format(
++                            fstype=fstype, force=force,
++                            opts=disk.get('mkfsopts', ''), dev=device),
++                        shell=True)
++                LOG.debug("mkfs stdout: {}".format(out))
++                LOG.debug("mkfs stderr: {}".format(err))
++                if disk.get('label'):
++                    self._set_partlabel(device, disk['label'], fstype)
++                else:
++                    self._set_partlabel(device, disk_name, fstype)
++
++        return devices
++
++    def _set_partlabel(self, device, label, fstype):
++        mapping = {'swap': ['swaplabel', '-L', label, device],
++                   'ext2': ['e2label', device, label],
++                   'ext3': ['e2label', device, label],
++                   'ext4': ['e2label', device, label],
++                   'xfs': ['xfs_admin', '-L', label, device],
++                   'vfat': ['fatlabel', device, label],
++                   'ntfs': ['ntfslabel', device, label],
++                   'btrfs': ['btrfs', 'filesystem', 'label', device, label],
++                   'jfs': ['jfs_tune', '-L', label, device],
++                   'reiserfs': ['reiserfstune', '-l', label, device]}
++        if fstype in mapping:
++            cmd = mapping[fstype]
++        else:  # try making partition label
++            device, number = re.match('(.+)(\d+)', device).groups()
++            cmd = ['parted', device, '-s', '--', 'name', number, label]
++        utils.execute(*cmd)
++
+     def get_disks_by_labels(self):
+-        return {}
++        drives_json, err = utils.execute(
++            'lsblk', '-Jlo', 'NAME,LABEL,PARTLABEL,TYPE')
++        blockdevices = json.loads(drives_json)['blockdevices']
++        partitions = {}
++        for d in blockdevices:
++            if d['partlabel']:
++                if d['type'] == 'lvm':
++                    partitions[d['partlabel']] = '/dev/' +\
++                                                 d['name'].replace('-', '/', 1)
++                else:
++                    partitions[d['partlabel']] = '/dev/' + d['name']
++
++        for d in blockdevices:  # overwrite with filesystem labels
++            if d['label']:
++                if d['type'] == 'lvm':
++                    partitions[d['label']] = '/dev/' +\
++                                             d['name'].replace('-', '/', 1)
++                else:
++                    partitions[d['label']] = '/dev/' + d['name']
++
++        devices = {}
++        try:
++            for disk_name, disk in self.conf.items():
++                if disk.get('label'):
++                    label = disk['label']
++                else:
++                    label = disk_name
++                devices[disk_name] = partitions[label]
++        except KeyError as e:
++            raise exceptions.EnvError('Preserve flag set, but device with'
++                                      ' "{}" label not found.'.format(*e.args))
++        return devices
++
++    @staticmethod
++    def _cmd_exists(cmd):
++        return any(
++            os.access(os.path.join(path, cmd), os.X_OK)
++            for path in os.environ["PATH"].split(os.pathsep)
++        )
+ 
+     def is_efi_boot(self):
++        for name, disk in self.conf.items():
++            if disk.get('mountpoint') == '/boot/efi' \
++               or 'efi' == disk.get('label', '').lower():
++                return True
+         return False
+ 
+     def get_boot_partition(self):
+-        pass  # TODO(xek)
++        for name, disk in self.conf.items():
++            if disk.get('mountpoint') == '/boot/efi' \
++               or 'efi' == disk.get('label', '').lower():
++                return name
++        for name, disk in self.conf.items():
++            if 'boot' == disk.get('label', '').lower():
++                return name
++        for name, disk in self.conf.items():
++            if disk.get('mountpoint') == '/boot':
++                return name
++        for name, disk in self.conf.items():
++            if disk.get('mountpoint') == '/' \
++               or disk.get('label') == '/':
++                return name
+ 
+     def get_fstype(self, label):
+-        return ''  # TODO(xek)
++        """Return a partition filesystem type.
++
++        Valid types are: ext2, fat32, fat16, HFS, linux-swap, NTFS, reiserfs,
++        ufs, but not all of these are returned here.
++
++        Default is blank ('').
++        """
++        mapping = {
++            'vfat': 'fat32',
++            'swap': 'linux-swap',
++            'ntfs': 'NTFS'
++        }
++        fstype = self.conf.get(label, {}).get('fstype')
++        return mapping.get(fstype, '')
+diff --git a/ironic_lib/tests/examples/example_efi.yaml b/ironic_lib/tests/examples/example_efi.yaml
+new file mode 100644
+index 0000000..fe774d9
+--- /dev/null
++++ b/ironic_lib/tests/examples/example_efi.yaml
+@@ -0,0 +1,23 @@
++disk_config:
++  partition_table: gpt
++  blockdev:
++    sda:
++      candidates:
++        serial: 55cd2e404c02bac5
++      partitions:
++        d0p1:
++          size: 550M
++        d0p2:
++          size: 550M
++        d0p3:
++          minsize: 2G
++  filesystems:
++    d0p1:
++      mountpoint: /boot/efi
++      label: /boot/efi
++      fstype: vfat
++    d0p2:
++      label: /boot
++      mountpoint: /boot
++    d0p3:
++      mountpoint: /
+diff --git a/ironic_lib/tests/examples/example_preserve_filesystem.yaml b/ironic_lib/tests/examples/example_preserve_filesystem.yaml
+new file mode 100644
+index 0000000..d573d35
+--- /dev/null
++++ b/ironic_lib/tests/examples/example_preserve_filesystem.yaml
+@@ -0,0 +1,47 @@
++disk_config:
++  partition_table: gpt
++  blockdev:
++    sda:
++      candidates: any
++      partitions:
++        d0p1:
++          size: 512M
++        d0p2:
++          minsize: 2G
++  lvm:
++    sys:
++      LVs:
++        home:
++          minsize: 1G
++        root:
++          size: 10G
++        swap:
++          size: memsize
++        var:
++          size: 4G
++        tmp:
++          size: 4G
++      PVs:
++        - d0p2
++  filesystems:
++    d0p1:
++      label: boot
++      mountpoint: /boot
++      fstype: ext3
++      preserve: 1
++    home:
++      mountpoint: /home
++      fstype: btrfs
++      preserve: 1
++    root:
++      mountpoint: /
++    swap:
++      fstype: swap
++      preserve: 1
++    var:
++      mountpoint: /var
++      fstype: vfat
++      preserve: 1
++    tmp:
++      mountpoint: /tmp
++      fstype: ext4
+diff --git a/ironic_lib/tests/test_examples.py b/ironic_lib/tests/test_examples.py
+index e69bc2d..499aa1c 100644
+--- a/ironic_lib/tests/test_examples.py
++++ b/ironic_lib/tests/test_examples.py
+@@ -78,3 +78,7 @@ class SystemInstallerExamplesTestCase(test_base.BaseTestCase):
+         y = SystemInstaller(
+             open(EXAMPLES_DIR + 'megacli_partitions.yaml').read())
+         y.validate_conf()
++
++    def test_example_efi(self):
++        y = SystemInstaller(open(EXAMPLES_DIR + 'example_efi.yaml').read())
++        y.validate_conf()
+diff --git a/ironic_lib/tests/test_filesystemsetup.py b/ironic_lib/tests/test_filesystemsetup.py
+new file mode 100644
+index 0000000..cc3444a
+--- /dev/null
++++ b/ironic_lib/tests/test_filesystemsetup.py
+@@ -0,0 +1,205 @@
++# Copyright (c) 2018 Intel Corporation
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++# implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import unittest
++
++import mock
++
++from ironic_lib.system_installer import exceptions
++from ironic_lib.system_installer import filesystemsetup
++
++
++class FilesystemSetupTestCase(unittest.TestCase):
++
++    def test_validate_conf(self):
++        filesystem_setup = filesystemsetup.FilesystemSetup(
++            {'filesystems': {'sda': {
++                'mountpoint': '/boot',
++                'label': 'boot'}}})
++        filesystem_setup.validate_conf()
++
++    def test_validate_conf_error(self):
++        filesystem_setup = filesystemsetup.FilesystemSetup(
++            {'filesystems': {'sda': {}}})
++        with self.assertRaises(exceptions.ConfError):
++            filesystem_setup.validate_conf()
++
++    def test_get_src_names(self):
++        filesystem_setup = filesystemsetup.FilesystemSetup(
++            {'filesystems': {'boot': {}, 'home': {}}})
++        self.assertEqual(set(filesystem_setup.get_src_names()),
++                         set(['boot', 'home']))
++
++    def test_validate_env(self):
++        filesystem_setup = filesystemsetup.FilesystemSetup(
++            {'filesystems': {'boot': {'fstype': 'ext2'},
++                             'home': {'fstype': 'ext3'}}})
++        filesystem_setup.validate_env()
++
++    def test_validate_env_match_fail(self):
++        filesystem_setup = filesystemsetup.FilesystemSetup(
++            {'filesystems': {'boot': {'fstype': 'foo'}, 'home': {}}})
++        with self.assertRaises(exceptions.EnvError):
++            filesystem_setup.validate_env()
++
++    def test_get_boot_partition(self):
++        filesystem_setup = filesystemsetup.FilesystemSetup(
++            {'filesystems': {'boot': {'mountpoint': '/boot'},
++                             'root': {'mountpoint': '/'}}})
++        self.assertEqual(filesystem_setup.get_boot_partition(), 'boot')
++
++    def test_get_boot_partition_efi(self):
++        filesystem_setup = filesystemsetup.FilesystemSetup(
++            {'filesystems': {'boot': {'mountpoint': '/boot'},
++                             'uefi': {'mountpoint': '/boot/efi'},
++                             'root': {'mountpoint': '/'}}})
++        self.assertEqual(filesystem_setup.get_boot_partition(), 'uefi')
++
++    def test_get_boot_partition_root(self):
++        filesystem_setup = filesystemsetup.FilesystemSetup(
++            {'filesystems': {'sda1': {'mountpoint': '/',
++                                      'label': 'test'}}})
++        self.assertEqual(filesystem_setup.get_boot_partition(), 'sda1')
++
++    def test_get_boot_partition_boot(self):
++        filesystem_setup = filesystemsetup.FilesystemSetup(
++            {'filesystems': {'sda1': {'mountpoint': '/boot',
++                                      'label': 'boot'},
++                             'sda2': {'mountpoint': '/'}}})
++        self.assertEqual(filesystem_setup.get_boot_partition(), 'sda1')
++
++    def test_get_boot_partition_none(self):
++        filesystem_setup = filesystemsetup.FilesystemSetup(
++            {'filesystems': {}})
++        self.assertIsNone(filesystem_setup.get_boot_partition())
++
++    def test_get_fstype(self):
++        filesystem_setup = filesystemsetup.FilesystemSetup(
++            {'filesystems': {'boot': {'mountpoint': '/boot'},
++                             'uefi': {'mountpoint': '/boot/efi',
++                                      'fstype': 'vfat'},
++                             'swap': {'fstype': 'swap'},
++                             'root': {'mountpoint': '/',
++                                      'fstype': 'ext4'},
++                             'opt': {'fstype': 'ntfs'}}})
++        self.assertEqual(filesystem_setup.get_fstype('boot'), '')
++        self.assertEqual(filesystem_setup.get_fstype('root'), '')
++        self.assertEqual(filesystem_setup.get_fstype('uefi'), 'fat32')
++        self.assertEqual(filesystem_setup.get_fstype('swap'), 'linux-swap')
++        self.assertEqual(filesystem_setup.get_fstype('opt'), 'NTFS')
++
++    def test_setup_disks(self):
++        with mock.patch('ironic_lib.utils.execute',
++                        return_value=('', 0)) as exe_mock:
++
++            filesystem_setup = filesystemsetup.FilesystemSetup(
++                {'filesystems': {'boot': {'mountpoint': '/boot',
++                                          'mkfsopts': 'foo',
++                                          'fstype': 'ext3'},
++                                 'home': {'mountpoint': '/home'},
++                                 'tmp': {'mountpoint': '/tmp',
++                                         'fstype': 'ext4'},
++                                 'var': {'mountpoint': '/var',
++                                         'fstype': 'btrfs'},
++                                 'opt': {'mountpoint': '/opt',
++                                         'fstype': 'vfat'}}})
++            filesystem_setup.setup_disks({})
++            exe_mock.assert_any_call('yes | mkfs.xfs -f  home', shell=True)
++            exe_mock.assert_any_call('yes | mkfs.ext3  foo boot', shell=True)
++            exe_mock.assert_any_call('yes | mkfs.ext4   tmp', shell=True)
++            exe_mock.assert_any_call('yes | mkfs.btrfs -f  var', shell=True)
++            exe_mock.assert_any_call('yes | mkfs.vfat   opt', shell=True)
++
++    def test_set_partlabel(self):
++        with mock.patch('ironic_lib.utils.execute',
++                        return_value=('', 0)) as exe_mock:
++
++            filesystem_setup = filesystemsetup.FilesystemSetup(
++                {'filesystems': {'boot': {'mountpoint': '/boot',
++                                          'fstype': 'ext2'},
++                                 'home': {'mountpoint': '/home'},
++                                 'test': {'fstype': 'xfs',
++                                          'mountpoint': '/opt'}}})
++            filesystem_setup.setup_disks({})
++            exe_mock.assert_any_call('e2label', 'boot', 'boot')
++            exe_mock.assert_any_call('xfs_admin', '-L', 'home', 'home')
++            exe_mock.assert_any_call('xfs_admin', '-L', 'test', 'test')
++
++    def test_has_preserve(self):
++        filesystem_setup = filesystemsetup.FilesystemSetup(
++            {'filesystems': {'boot': {'mountpoint': '/boot',
++                                      'fstype': 'ext2'},
++                             'home': {'mountpoint': '/home'},
++                             'test': {'fstype': 'xfs',
++                                      'mountpoint': '/opt'}}})
++        self.assertFalse(filesystem_setup.has_preserve())
++        filesystem_setup = filesystemsetup.FilesystemSetup(
++            {'filesystems': {'boot': {'mountpoint': '/boot',
++                                      'fstype': 'ext2'},
++                             'home': {'mountpoint': '/home'},
++                             'test': {'fstype': 'xfs',
++                                      'preserve': 1,
++                                      'mountpoint': '/opt'}}})
++        self.assertTrue(filesystem_setup.has_preserve())
++
++    def test_get_disk_by_labels(self):
++
++        def execute_result(command, *args, **kwargs):
++            if command == 'lsblk':
++                return ("""{
++   "blockdevices": [
++      {"name": "loop0", "label": null, "partlabel": null, "type": "disk"},
++      {"name": "loop1", "label": null, "partlabel": null, "type": "disk"},
++      {"name": "sda", "label": null, "partlabel": null, "type": "disk"},
++      {"name": "sda1", "label": null,
++      "partlabel": "EFI System Partition","type": "disk"},
++      {"name": "sda2", "label": null, "partlabel": null, "type": "disk"},
++      {"name": "sda3", "label": null, "partlabel": null,"type": "disk"},
++      {"name": "sda3_crypt", "label": null, "partlabel": null, "type": "disk"},
++      {"name": "xubuntu--vg-root", "label": "home",
++      "partlabel": null, "type": "disk"},
++      {"name": "xubuntu--vg-swap_1", "label": "test",
++      "partlabel": null, "type": "disk"},
++      {"name": "sys-tmp", "label": "tmp", "partlabel": null, "type": "lvm"}
++   ]
++}""", '')
++            return ('', '')
++
++        with mock.patch('ironic_lib.utils.execute',
++                        side_effect=execute_result):
++
++            filesystem_setup = filesystemsetup.FilesystemSetup(
++                {'filesystems': {'boot': {'mountpoint': '/boot',
++                                          'fstype': 'ext2',
++                                          'label': "EFI System Partition"},
++                                 'home': {'mountpoint': '/home'},
++                                 'test': {'fstype': 'xfs',
++                                          'preserve': 1,
++                                          'mountpoint': '/opt'}}})
++            self.assertDictEqual({'test': u'/dev/xubuntu--vg-swap_1',
++                                  'home': u'/dev/xubuntu--vg-root',
++                                  'boot': u'/dev/sda1'},
++                                 filesystem_setup.get_disks_by_labels())
++            filesystem_setup = filesystemsetup.FilesystemSetup(
++                {'filesystems': {'boot': {'mountpoint': '/boot',
++                                          'fstype': 'ext2',
++                                          'label': "EFI System Partition"},
++                                 'extra': {},
++                                 'home': {'mountpoint': '/home'},
++                                 'test': {'fstype': 'xfs',
++                                          'preserve': 1,
++                                          'mountpoint': '/opt'}}})
++            with self.assertRaises(exceptions.EnvError):
++                filesystem_setup.get_disks_by_labels()
+-- 
+2.14.1
+
