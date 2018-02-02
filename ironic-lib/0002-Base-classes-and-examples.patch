@@ -1,0 +1,3038 @@
+From b03e3f9c8d0844e94f88e3f449c7eecc973c91fe Mon Sep 17 00:00:00 2001
+From: Grzegorz Grasza <grzegorz@grasza.com>
+Date: Thu, 16 Nov 2017 15:40:59 +0100
+Subject: [PATCH 02/11] Base classes and examples
+
+Examples and basic tests for disk_config validation
+Each kind of setup operation is an independent class
+Adds README and HACKING documentation
+
+Co-Authored-By: Grzegorz Grasza <grzegorz.grasza@intel.com>
+Co-Authored-By: Piotr Prokop <piotr.prokop@intel.com>
+Co-Authored-By: Roman Dobosz <roman.dobosz@intel.com>
+Co-Authored-By: Marta Mucek <marta.mucek@intel.com>
+---
+ doc/source/system_installer.rst                    |  92 ++
+ ironic_lib/system_installer/__init__.py            | 181 ++++
+ ironic_lib/system_installer/base.py                |  53 ++
+ ironic_lib/system_installer/exceptions.py          |  26 +
+ ironic_lib/system_installer/filesystemsetup.py     |  34 +
+ ironic_lib/system_installer/hpssaclisetup.py       |  26 +
+ ironic_lib/system_installer/lvmsetup.py            |  28 +
+ ironic_lib/system_installer/megaclisetup.py        |  26 +
+ ironic_lib/system_installer/partitionsetup.py      |  27 +
+ ironic_lib/system_installer/schema.json            | 225 +++++
+ ironic_lib/system_installer/swraidsetup.py         |  29 +
+ ironic_lib/system_installer/systemsetup.py         |  20 +
+ ironic_lib/system_installer/tools.py               |  36 +
+ .../tests/examples/Disk_openhouse_preserve_hv.yaml |  44 +
+ .../examples/Rhel_layout_1disk_1partition.yaml     |  18 +
+ .../tests/examples/Rhel_layout_4disk_raid10.yaml   | 101 +++
+ .../tests/examples/Rhel_layout_6disk_raid5.yaml    | 125 +++
+ .../tests/examples/Rhel_layout_cm3_rhel_mysql.yaml |  43 +
+ ironic_lib/tests/examples/example1.yaml            |  39 +
+ ironic_lib/tests/examples/example_conf1.yaml       |  16 +
+ ironic_lib/tests/examples/m10n_chef.yaml           |  22 +
+ ironic_lib/tests/examples/megacli_partitions.yaml  |  26 +
+ ironic_lib/tests/examples/use_2nd_disk.yaml        |  40 +
+ ironic_lib/tests/examples/yse_bnode_4disk.yaml     | 111 +++
+ ironic_lib/tests/examples/yse_bnode_4disk_gpt.yaml | 115 +++
+ ironic_lib/tests/examples/yse_bnode_fsprofile.yaml | 114 +++
+ ironic_lib/tests/test_examples.py                  |  79 ++
+ ironic_lib/tests/test_system_installer.py          | 976 +++++++++++++++++++++
+ ironic_lib/tests/test_system_installer_base.py     |  48 +
+ requirements.txt                                   |   4 +
+ tools/system_installer.py                          |  26 +
+ tox.ini                                            |   4 +-
+ 32 files changed, 2753 insertions(+), 1 deletion(-)
+ create mode 100644 doc/source/system_installer.rst
+ create mode 100644 ironic_lib/system_installer/__init__.py
+ create mode 100644 ironic_lib/system_installer/base.py
+ create mode 100644 ironic_lib/system_installer/exceptions.py
+ create mode 100644 ironic_lib/system_installer/filesystemsetup.py
+ create mode 100644 ironic_lib/system_installer/hpssaclisetup.py
+ create mode 100644 ironic_lib/system_installer/lvmsetup.py
+ create mode 100644 ironic_lib/system_installer/megaclisetup.py
+ create mode 100644 ironic_lib/system_installer/partitionsetup.py
+ create mode 100644 ironic_lib/system_installer/schema.json
+ create mode 100644 ironic_lib/system_installer/swraidsetup.py
+ create mode 100644 ironic_lib/system_installer/systemsetup.py
+ create mode 100644 ironic_lib/system_installer/tools.py
+ create mode 100644 ironic_lib/tests/examples/Disk_openhouse_preserve_hv.yaml
+ create mode 100644 ironic_lib/tests/examples/Rhel_layout_1disk_1partition.yaml
+ create mode 100644 ironic_lib/tests/examples/Rhel_layout_4disk_raid10.yaml
+ create mode 100644 ironic_lib/tests/examples/Rhel_layout_6disk_raid5.yaml
+ create mode 100644 ironic_lib/tests/examples/Rhel_layout_cm3_rhel_mysql.yaml
+ create mode 100644 ironic_lib/tests/examples/example1.yaml
+ create mode 100644 ironic_lib/tests/examples/example_conf1.yaml
+ create mode 100644 ironic_lib/tests/examples/m10n_chef.yaml
+ create mode 100644 ironic_lib/tests/examples/megacli_partitions.yaml
+ create mode 100644 ironic_lib/tests/examples/use_2nd_disk.yaml
+ create mode 100644 ironic_lib/tests/examples/yse_bnode_4disk.yaml
+ create mode 100644 ironic_lib/tests/examples/yse_bnode_4disk_gpt.yaml
+ create mode 100644 ironic_lib/tests/examples/yse_bnode_fsprofile.yaml
+ create mode 100644 ironic_lib/tests/test_examples.py
+ create mode 100644 ironic_lib/tests/test_system_installer.py
+ create mode 100644 ironic_lib/tests/test_system_installer_base.py
+ create mode 100755 tools/system_installer.py
+
+diff --git a/doc/source/system_installer.rst b/doc/source/system_installer.rst
+new file mode 100644
+index 0000000..32ce518
+--- /dev/null
++++ b/doc/source/system_installer.rst
+@@ -0,0 +1,92 @@
++================
++System Installer
++================
++
++This is a Python module for formatting disks. The configuration format is
++described in the ``ironic_lib/system_installer/schema.json``. See example
++configurations in ``ironic_lib/tests/examples/``.
++
++Getting Started
++===============
++
++Example usage:
++
++
++.. code-block:: python
++
++   from ironic_lib.system_installer import SystemInstaller, ConfError
++
++   system_installer = SystemInstaller(yaml_configuration_string)
++   try:
++       system_installer.validate_conf()
++   except ConfError:
++       print('bad configuration provided')
++   else:
++       system_installer.install(qcow2_image_path)
++
++Preserve flag handling
++======================
++
++In case a preserve flag is set on a filesystem, all previous disks partitioning,
++RAID setup etc. is skipped. Partition devices are mapped by their labels and
++those without the preserve flag are reformatted, while the filesystems marked
++with ``preserve`` are only added to fstab. They are also not mounted during the
++system installation.
++
++
++Code structure
++==============
++
++The main module is located in ``ironic_lib/system_installer/__init__.py``.
++To limit the spagetti code and make the code more readable, it is structured
++the same way as the configuration file. The SystemInstaller class calls methods
++on a list of classes derived from ``ironic_lib/system_installer/base.py``,
++which perform separate functions, like partitioning, setting up RAIDs and LVMs,
++creating filesystems and finally installing the system.
++
++Implementing a new setup class
++==============================
++
++The default ``__init__`` method saves the part of the config with which the
++particular class should be concerned (like only the LVM configuration)
++in ``self.conf``.
++
++All classes implementing the Setup interface should implement at least the
++``get_src_names``, ``get_dst_names`` and ``setup_disks`` methods.
++
++The first two methods are used in configuration validation. They return lists
++of labels used throught the configuration. ``get_src_names`` returns the labels
++of devices which are needed as input to the disk setup. This method should
++parse the configuration and return a list of all input device names.
++``get_dst_names`` should return another list, which contains the output names
++of created devices.
++
++The last required method is ``setup_disks``. It takes a dictionary
++containing a translation of names/labels used in the configuration to device
++names needed as input for system commandline tools, implementing the
++particular class behavior. This method should perform the disk setup and
++return the same dictionary, enchanced with new keys (labels used in the config)
++and values (new device filenames). If the input dictionary already contains
++labels of devices which would normally be processed by the class, this means
++they are already configured and should not be touched. The same applies to
++devices present in the input dictionary - they should be excluded from
++searches for new input devices, because they are already used.
++
++First optional method is ``clean_disks``, it is run before the ``setup_disks``
++method and in reverse (meaning, that FilesystemSetup is run before
++PartitioningSetup). It accepts a dictionary with labels and devices it
++shouldn't touch.
++
++Two last methods that you may want to implement is additional validation of
++the configuration in ``validate_conf``, which should raise ``ConfError`` in
++case of a configuration error and ``validate_env`` (raising ``EnvError``,
++which should do basic checks on the environment, before running the disk setup
++process.
++
++The new class should be imported in ``__init__.py`` and run in a proper order
++to perform the disk setup.
++
++Unit tests and examples should be added in the ``ironic_lib/tests/`` and
++``ironic_lib/tests/examples/`` directories.
++
++Any global validation checks are implemented in ``__init__.py``.
+diff --git a/ironic_lib/system_installer/__init__.py b/ironic_lib/system_installer/__init__.py
+new file mode 100644
+index 0000000..4dbf38c
+--- /dev/null
++++ b/ironic_lib/system_installer/__init__.py
+@@ -0,0 +1,181 @@
++# Copyright (c) 2018 Intel Corporation
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++# implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import json
++import pkgutil
++
++import jsonschema
++from oslo_log import log
++
++from ironic_lib.system_installer.exceptions import ConfError
++from ironic_lib.system_installer.exceptions import EnvError
++from ironic_lib.system_installer.filesystemsetup import FilesystemSetup
++from ironic_lib.system_installer.hpssaclisetup import HpSsaCliSetup
++from ironic_lib.system_installer.lvmsetup import LvmSetup
++from ironic_lib.system_installer.megaclisetup import MegaCliSetup
++from ironic_lib.system_installer.partitionsetup import PartitionSetup
++from ironic_lib.system_installer.swraidsetup import SwRaidSetup
++from ironic_lib.system_installer.systemsetup import SystemSetup
++from ironic_lib.system_installer.tools import ordered_load
++
++
++LOG = log.getLogger()
++
++SCHEMA = json.loads(pkgutil.get_data(__name__, 'schema.json').decode('utf-8'))
++
++
++class SystemInstaller(object):
++    def __init__(self, conf):
++        self.conf = ordered_load(conf)['disk_config']
++
++    def validate_conf(self):
++        """Check that the configuration is consistent"""
++        try:
++            config = {"disk_config": self.conf}
++            jsonschema.validate(config, SCHEMA)
++        except Exception as e:
++            raise ConfError(
++                "Config doesn't match the schema: {}".format(e.args[0]))
++
++        if MegaCliSetup.conf_key in self.conf:
++            megacli = MegaCliSetup(self.conf)
++            megacli.validate_conf()
++        filesystemsetup = FilesystemSetup(self.conf)
++        filesystemsetup.validate_conf()
++        filesystems = filesystemsetup.get_src_names()
++        if LvmSetup.conf_key in self.conf:
++            lvm = LvmSetup(self.conf)
++            lvm.validate_conf()
++            pvs = lvm.get_src_names()
++            lvs = lvm.get_dst_names()
++        else:
++            pvs = []
++            lvs = []
++        if SwRaidSetup.conf_key in self.conf:
++            swraid = SwRaidSetup(self.conf)
++            swraid.validate_conf()
++            raids = swraid.get_dst_names()
++            raid_partitions = swraid.get_src_names()
++        else:
++            raids = []
++            raid_partitions = []
++        partition_setup = PartitionSetup(self.conf)
++        partition_setup.validate_conf()
++        partitions = partition_setup.get_dst_names()
++
++        if not set(filesystems).issubset(set(partitions + lvs + raids)):
++            raise ConfError('Partitions for filesystems are undefined.')
++
++        if not set(pvs).issubset(set(partitions + raids)):
++            raise ConfError('Partitions for volumes are undefined.')
++
++        if not set(raid_partitions).issubset(set(partitions + raids)):
++            raise ConfError('Partitions for RAIDs are undefined.')
++
++    def validate_env(self):
++        """Run validate_env on all subclasses of Setup"""
++        if MegaCliSetup.conf_key in self.conf:
++            if MegaCliSetup.is_megacli_controller():
++                MegaCliSetup(self.conf).validate_env()
++            elif HpSsaCliSetup.is_hpraid_controller():
++                HpSsaCliSetup(self.conf).validate_env()
++            else:
++                raise EnvError('No HP or MegaRAID controller found')
++
++        for setup in [PartitionSetup, SwRaidSetup, LvmSetup,
++                      FilesystemSetup, SystemSetup]:
++            if setup.conf_key in self.conf:
++                setup(self.conf).validate_env()
++
++    def validate_env_preserve(self):
++        """Run validate_env on all subclasses of Setup"""
++        for setup in [FilesystemSetup, SystemSetup]:
++            if setup.conf_key in self.conf:
++                setup(self.conf).validate_env()
++
++    def clean_disks(self):
++        """Run clean_disks on all subclasses of Setup, in reverse"""
++        for setup in [SystemSetup, LvmSetup, SwRaidSetup, FilesystemSetup,
++                      PartitionSetup]:
++            setup.clean_disks({})
++
++        if MegaCliSetup.is_megacli_controller():
++            MegaCliSetup.clean_disks({})
++        elif HpSsaCliSetup.is_hpraid_controller():
++            HpSsaCliSetup.clean_disks({})
++
++    def partition_disks(self, devices):
++        return PartitionSetup(self.conf).setup_disks(devices)
++
++    def make_swraid(self, devices):
++        if SwRaidSetup.conf_key in self.conf:
++            return SwRaidSetup(self.conf).setup_disks(devices)
++        return devices
++
++    def make_hwraid(self, devices):
++        if MegaCliSetup.conf_key in self.conf:
++            if MegaCliSetup.is_megacli_controller():
++                return MegaCliSetup(self.conf).setup_disks(devices)
++            elif HpSsaCliSetup.is_hpraid_controller():
++                return HpSsaCliSetup(self.conf).setup_disks(devices)
++            else:
++                raise EnvError('No HP or MegaRAID controller found')
++
++        return devices
++
++    def make_lvm(self, devices):
++        if LvmSetup.conf_key in self.conf:
++            return LvmSetup(self.conf).setup_disks(devices)
++        return devices
++
++    def format_partitions(self, devices):
++        return FilesystemSetup(self.conf).setup_disks(devices)
++
++    def install_system(self, devices, image_path):
++        return SystemSetup(self.conf).setup_disks(devices, image_path)
++
++    def install(self, image_path):
++        self.validate_conf()
++        devices = {}  # device map
++        preserve_run = False
++
++        filesystemsetup = FilesystemSetup(self.conf)
++        if filesystemsetup.has_preserve():
++            try:
++                devices = filesystemsetup.get_disks_by_labels()
++                preserve_run = True
++            except EnvError as e:
++                # Partition isn't found, go ahead and create it.
++                LOG.warning(e.args[0])
++                for disk in filesystemsetup.conf.values():
++                    if 'preserve' in disk:
++                        del disk['preserve']
++                # This is potentially dangerous, because if the system isn't
++                # initialized correctly and we don't find the labels, we
++                # will overwrite the data that the user wants to preserve.
++                LOG.warning('Creating new partitions.')
++            else:
++                self.validate_env_preserve()
++                LOG.info('Preserve flag set, formatting other partitions.')
++
++        if not preserve_run:
++            self.clean_disks()
++            self.validate_env()
++            devices = self.make_hwraid(devices)
++            devices = self.partition_disks(devices)
++            devices = self.make_swraid(devices)
++            devices = self.make_lvm(devices)
++        devices = self.format_partitions(devices)
++        return self.install_system(devices, image_path)
+diff --git a/ironic_lib/system_installer/base.py b/ironic_lib/system_installer/base.py
+new file mode 100644
+index 0000000..662306f
+--- /dev/null
++++ b/ironic_lib/system_installer/base.py
+@@ -0,0 +1,53 @@
++# Copyright (c) 2018 Intel Corporation
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++# implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++# Base classes
++
++
++class Setup(object):
++    """Base class for implementing various steps of system installation"""
++
++    conf_key = ''
++
++    def __init__(self, conf):
++        self.conf = conf[self.conf_key]
++
++    def validate_conf(self):
++        """Validate the contents of self.conf.
++
++        Raises: system_installer.exceptions.ConfError.
++        """
++
++    def validate_env(self):
++        """Validate the environment: check available commands and devices.
++
++        Raises: system_installer.exceptions.EnvError.
++        """
++
++    def get_src_names(self):
++        """Return a list of source device/filesystem names"""
++        raise NotImplemented()
++
++    def get_dst_names(self):
++        """Return a list of device/filesystem names that will be created"""
++        raise NotImplemented()
++
++    def setup_disks(self, devices, image_path=None):
++        """Format disks or setup RAID/LVM. Return created devices dict"""
++        raise NotImplemented()
++
++    @classmethod
++    def clean_disks(self, devices):
++        """Reset state of RAID/LVM setups, free all disks"""
+diff --git a/ironic_lib/system_installer/exceptions.py b/ironic_lib/system_installer/exceptions.py
+new file mode 100644
+index 0000000..6dcfa46
+--- /dev/null
++++ b/ironic_lib/system_installer/exceptions.py
+@@ -0,0 +1,26 @@
++# Copyright (c) 2018 Intel Corporation
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++# implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++
++class SystemInstallerException(Exception):
++    pass
++
++
++class ConfError(SystemInstallerException):
++    """Error in the configuration"""
++
++
++class EnvError(SystemInstallerException):
++    """Error in the setup environment"""
+diff --git a/ironic_lib/system_installer/filesystemsetup.py b/ironic_lib/system_installer/filesystemsetup.py
+new file mode 100644
+index 0000000..e3157d2
+--- /dev/null
++++ b/ironic_lib/system_installer/filesystemsetup.py
+@@ -0,0 +1,34 @@
++# Copyright (c) 2018 Intel Corporation
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++# implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from ironic_lib.system_installer.base import Setup
++
++
++class FilesystemSetup(Setup):
++    """Basic disk formatting implementation"""
++
++    conf_key = 'filesystems'
++
++    def get_src_names(self):
++        return list(self.conf)
++
++    def has_preserve(self):
++        for disk in self.conf.values():
++            if disk.get('preserve', False):
++                return True
++        return False
++
++    def get_disks_by_labels(self):
++        return {}
+diff --git a/ironic_lib/system_installer/hpssaclisetup.py b/ironic_lib/system_installer/hpssaclisetup.py
+new file mode 100644
+index 0000000..9cbecf2
+--- /dev/null
++++ b/ironic_lib/system_installer/hpssaclisetup.py
+@@ -0,0 +1,26 @@
++# Copyright (c) 2018 Intel Corporation
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++# implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from ironic_lib.system_installer.base import Setup
++
++
++class HpSsaCliSetup(Setup):
++    """Hardware RAID setup implementation"""
++
++    conf_key = 'hwraid'
++
++    @staticmethod
++    def is_hpraid_controller():
++        return False
+diff --git a/ironic_lib/system_installer/lvmsetup.py b/ironic_lib/system_installer/lvmsetup.py
+new file mode 100644
+index 0000000..890c95d
+--- /dev/null
++++ b/ironic_lib/system_installer/lvmsetup.py
+@@ -0,0 +1,28 @@
++# Copyright (c) 2018 Intel Corporation
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++# implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from ironic_lib.system_installer.base import Setup
++
++
++class LvmSetup(Setup):
++    """LVM setup implementation"""
++
++    conf_key = 'lvm'
++
++    def get_src_names(self):
++        return sum([list(v['PVs']) for v in self.conf.values()], [])
++
++    def get_dst_names(self):
++        return sum([list(v['LVs']) for v in self.conf.values()], [])
+diff --git a/ironic_lib/system_installer/megaclisetup.py b/ironic_lib/system_installer/megaclisetup.py
+new file mode 100644
+index 0000000..76cae96
+--- /dev/null
++++ b/ironic_lib/system_installer/megaclisetup.py
+@@ -0,0 +1,26 @@
++# Copyright (c) 2018 Intel Corporation
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++# implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from ironic_lib.system_installer.base import Setup
++
++
++class MegaCliSetup(Setup):
++    """Hardware RAID setup implementation"""
++
++    conf_key = 'hwraid'
++
++    @staticmethod
++    def is_megacli_controller():
++        return False
+diff --git a/ironic_lib/system_installer/partitionsetup.py b/ironic_lib/system_installer/partitionsetup.py
+new file mode 100644
+index 0000000..af318d1
+--- /dev/null
++++ b/ironic_lib/system_installer/partitionsetup.py
+@@ -0,0 +1,27 @@
++# Copyright (c) 2018 Intel Corporation
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++# implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from ironic_lib.system_installer.base import Setup
++
++
++class PartitionSetup(Setup):
++    """Basic partitioning implementation"""
++
++    conf_key = 'blockdev'
++
++    def get_dst_names(self):
++        partitions = [list(v.get('partitions', {}))
++                      for v in self.conf.values()]
++        return sum(partitions, [])
+diff --git a/ironic_lib/system_installer/schema.json b/ironic_lib/system_installer/schema.json
+new file mode 100644
+index 0000000..5650150
+--- /dev/null
++++ b/ironic_lib/system_installer/schema.json
+@@ -0,0 +1,225 @@
++{
++  "$schema": "http://json-schema.org/schema#",
++  "definitions": {
++    "partition": {
++      "type": "object",
++      "properties": {
++        "size": {
++          "type": "string",
++          "description": "Absolute size of partition"
++        },
++        "minsize": {
++          "type": "string",
++          "description": "Minimum size of partition, if any space left expand this partition"
++        },
++        "type": {
++          "type": "string",
++          "description": "Type of partition"
++        }
++      },
++      "oneOf": [
++        {"required": ["minsize"]},
++        {"required": ["size"]}
++      ],
++      "additionalProperties": false
++    },
++    "blockdevice": {
++      "type": "object",
++      "properties": {
++        "candidates": {
++          "oneOf": [
++            {
++              "type": "string",
++              "description": "Use any device.",
++              "enum": ["any"],
++              "default": "any"
++            },
++            {
++              "type": "object",
++              "description": "Dict of device hints to choose appropriate disk",
++              "properties": {
++                "serial": {
++                  "type": "string",
++                  "description": "Serial number of the disk"
++                },
++                "model": {
++                  "type": "string",
++                  "description": "Model of the disk"
++                },
++                "disk_type": {
++                  "type": "string",
++                  "enum": ["SSD", "HDD", "NVMe"],
++                  "description": "Type of disk to use"
++                },
++                "max_disk_size_gb": {
++                  "type": "string",
++                  "description": "Maximum size of the disk to use"
++                }
++              },
++              "additionalProperties": false
++            }
++          ]
++        },
++        "partitions": {
++          "type": "object",
++          "description": "Dictionary of partitions to create",
++          "additionalProperties": {"$ref": "#/definitions/partition"}
++        }
++      },
++      "additionalProperties": false
++    },
++    "logical_volume": {
++      "type": "object",
++      "properties": {
++        "size": {
++          "type": "string",
++          "description": "Absolute size of LV"
++        },
++        "minsize": {
++          "type": "string",
++          "description": "Minimum size of LV, if any space left expand this LV"
++        }
++      },
++      "oneOf": [
++        {"required": ["minsize"]},
++        {"required": ["size"]}
++      ],
++      "additionalProperties": false
++    },
++    "volume_group": {
++      "type": "object",
++      "properties": {
++        "LVs": {
++          "type": "object",
++          "description": "Dictionary of partitions to create",
++          "additionalProperties": {"$ref": "#/definitions/logical_volume"}
++        },
++        "PVs": {
++          "type": "array",
++          "items": {
++            "type": "string"
++          }
++        }
++      },
++      "additionalProperties": false
++    },
++    "filesystem": {
++      "type": "object",
++      "properties": {
++        "label": {
++          "type": "string",
++          "description": "Label of filesystem"
++        },
++        "mountpoint": {
++          "type": "string",
++          "description": "Where to mount this filesystem."
++        },
++        "fstype": {
++          "type": "string",
++          "description": "Filesystem to create on given partition",
++          "enum": ["xfs", "ext4", "ext3", "swap", "btrfs", "vfat"],
++          "default": "xfs"
++        },
++        "mountopts": {
++          "type": "string",
++          "description": "Options to include in /etc/fstab"
++        },
++        "mkfsopts": {
++          "type": "string",
++          "description": "Options to use when creating filesystem"
++        },
++        "preserve": {
++          "type": "number",
++          "enum": [0, 1],
++          "description": "If set to 1 prevent from wiping data on a given disk"
++        }
++      },
++      "additionalProperties": false
++    },
++    "hwraid": {
++      "type": "object",
++      "properties": {
++        "raidtype": {
++          "type": "number",
++          "enum": [0, 1, 10, 5, 6],
++          "description": "Type of software raid to use"
++        },
++        "stripe_size": {
++          "type": "number",
++          "enum": [64, 128, 256, 512, 1024],
++          "default": 512,
++          "description": "Stripe size in KB"
++        },
++        "partitions": {
++          "description": "List of partitions to make software raid from",
++          "type": "array",
++          "items": {
++            "type": "string"
++          }
++        }
++      },
++      "additionalProperties": false
++    },
++    "software_raid": {
++      "type": "object",
++      "properties": {
++        "raidtype": {
++          "type": "number",
++          "enum": [0, 1, 10, 5],
++          "description": "Type of software raid to use"
++        },
++        "partitions": {
++          "description": "List of partitions to make software raid from",
++          "type": "array",
++          "items": {
++            "type": "string"
++          }
++        }
++      },
++      "additionalProperties": false
++    }
++  },
++  "type": "object",
++  "properties": {
++    "disk_config": {
++      "type": "object",
++      "properties": {
++        "partition_table": {
++          "type": "string",
++          "enum": ["gpt", "mbr"],
++          "default": "mbr",
++          "description": "Partition table type to use"
++        },
++        "blockdev": {
++          "type": "object",
++          "description": "Dictionary of objects representing physical disk",
++          "additionalProperties": {"$ref": "#/definitions/blockdevice"}
++        },
++        "lvm": {
++          "type": "object",
++          "description": "Dictionary of volume groups",
++          "additionalProperties": {"$ref": "#/definitions/volume_group"}
++        },
++        "filesystems": {
++          "type": "object",
++          "description": "Dictionary of filesystems to create",
++          "additionalProperties": {"$ref": "#/definitions/filesystem"}
++        },
++        "swraid": {
++          "type": "object",
++          "description": "Dictionary of software raids to create",
++          "additionalProperties": {"$ref": "#/definitions/software_raid"}
++        },
++        "hwraid": {
++          "type": "object",
++          "description": "Dictionary of hardware raids to create",
++          "additionalProperties": {"$ref": "#/definitions/hwraid"}
++        }
++      },
++      "additionalProperties": false,
++      "required": ["filesystems", "blockdev"]
++    }
++  },
++  "additionalProperties": false,
++  "required": ["disk_config"]
++}
+diff --git a/ironic_lib/system_installer/swraidsetup.py b/ironic_lib/system_installer/swraidsetup.py
+new file mode 100644
+index 0000000..2965aaa
+--- /dev/null
++++ b/ironic_lib/system_installer/swraidsetup.py
+@@ -0,0 +1,29 @@
++# Copyright (c) 2018 Intel Corporation
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++# implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from ironic_lib.system_installer.base import Setup
++
++
++class SwRaidSetup(Setup):
++    """Software RAID setup implementation"""
++
++    conf_key = 'swraid'
++
++    def get_src_names(self):
++        raid_partitions = [r['partitions'] for r in self.conf.values()]
++        return sum(raid_partitions, [])
++
++    def get_dst_names(self):
++        return list(self.conf)
+diff --git a/ironic_lib/system_installer/systemsetup.py b/ironic_lib/system_installer/systemsetup.py
+new file mode 100644
+index 0000000..e03c5b4
+--- /dev/null
++++ b/ironic_lib/system_installer/systemsetup.py
+@@ -0,0 +1,20 @@
++# Copyright (c) 2018 Intel Corporation
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++# implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from ironic_lib.system_installer.filesystemsetup import FilesystemSetup
++
++
++class SystemSetup(FilesystemSetup):
++    """Basic disk formatting implementation"""
+diff --git a/ironic_lib/system_installer/tools.py b/ironic_lib/system_installer/tools.py
+new file mode 100644
+index 0000000..71f6d60
+--- /dev/null
++++ b/ironic_lib/system_installer/tools.py
+@@ -0,0 +1,36 @@
++# Copyright (c) 2018 Intel Corporation
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++# implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import collections
++import json
++import yaml
++
++
++def ordered_load(disk_conf):
++    """Load JSON or YAML configuration as OrderedDicts"""
++    try:  # Parse JSON as OrderedDicts
++        return json.loads(disk_conf, object_pairs_hook=collections.OrderedDict)
++    except ValueError:
++        # Parse YAML as OrderedDicts
++        class OrderedLoader(yaml.SafeLoader):
++            pass
++
++        def construct_mapping(loader, node):
++            loader.flatten_mapping(node)
++            return collections.OrderedDict(loader.construct_pairs(node))
++        OrderedLoader.add_constructor(
++            yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
++            construct_mapping)
++        return yaml.load(disk_conf, OrderedLoader)
+diff --git a/ironic_lib/tests/examples/Disk_openhouse_preserve_hv.yaml b/ironic_lib/tests/examples/Disk_openhouse_preserve_hv.yaml
+new file mode 100644
+index 0000000..39cb2b0
+--- /dev/null
++++ b/ironic_lib/tests/examples/Disk_openhouse_preserve_hv.yaml
+@@ -0,0 +1,44 @@
++# Preserves /openstack partition
++disk_config:
++  blockdev:
++    disk0:
++      candidates: any
++      partitions:
++        d0p1:
++          size: 512M
++        d0p2:
++          minsize: 577G
++  lvm:
++    sys:
++      LVs:
++        openstack:
++          minsize: 1G
++        home:
++          size: 30G
++        root:
++          size: 16G
++        swap:
++          size: 200G
++        var:
++          size: 10G
++        tmp:
++          size: 4G
++      PVs:
++        - d0p2
++  filesystems:
++    d0p1:
++      label: /boot
++      mountpoint: /boot
++    home:
++      mountpoint: /home
++    root:
++      mountpoint: /
++    swap:
++      fstype: swap
++    var:
++      mountpoint: /var
++    tmp:
++      mountpoint: /tmp
++    openstack:
++      mountpoint: /openstack
++      preserve: 1
+diff --git a/ironic_lib/tests/examples/Rhel_layout_1disk_1partition.yaml b/ironic_lib/tests/examples/Rhel_layout_1disk_1partition.yaml
+new file mode 100644
+index 0000000..2eac8a0
+--- /dev/null
++++ b/ironic_lib/tests/examples/Rhel_layout_1disk_1partition.yaml
+@@ -0,0 +1,18 @@
++disk_config:
++  blockdev:
++    disk0:
++      candidates: any
++      partitions:
++        d0p1:
++          minsize: 2G
++        d0p2:
++          size: memsize
++          type: linux-swap
++  filesystems:
++    d0p1:
++      fstype: ext3
++      label: /
++      mountpoint: /
++    d0p2:
++      fstype: swap
++ 
+\ No newline at end of file
+diff --git a/ironic_lib/tests/examples/Rhel_layout_4disk_raid10.yaml b/ironic_lib/tests/examples/Rhel_layout_4disk_raid10.yaml
+new file mode 100644
+index 0000000..9a0f269
+--- /dev/null
++++ b/ironic_lib/tests/examples/Rhel_layout_4disk_raid10.yaml
+@@ -0,0 +1,101 @@
++disk_config:
++  blockdev:
++    disk0:
++      candidates: any
++      partitions:
++        d0p0:
++          size: 4G
++        d0p1:
++          size: 4G
++        d0p2:
++          size: 4G
++        d0p3:
++          minsize: 2G
++    disk1:
++      candidates: any
++      partitions:
++        d1p0:
++          size: 4G
++        d1p1:
++          size: 4G
++        d1p2:
++          size: 4G
++        d1p3:
++          minsize: 2G
++    disk2:
++      candidates: any
++      partitions:
++        d2p0:
++          size: 4G
++          type: linux-swap
++        d2p1:
++          size: 4G
++        d2p2:
++          size: 4G
++        d2p3:
++          minsize: 2G
++    disk3:
++      candidates: any
++      partitions:
++        d3p0:
++          size: 4G
++          type: linux-swap
++        d3p1:
++          size: 4G
++        d3p2:
++          size: 4G
++        d3p3:
++          minsize: 2G
++  swraid:
++    md0:
++      raidtype: 1
++      partitions:
++        - d0p0
++        - d1p0
++    md1:
++      raidtype: 5
++      partitions:
++        - d0p1
++        - d1p1
++        - d2p1
++        - d3p1
++    md2:
++      raidtype: 5
++      partitions:
++        - d0p2
++        - d1p2
++        - d2p2
++        - d3p2
++    md3:
++      raidtype: 0
++      partitions:
++        - d0p3
++        - d1p3
++    md4:
++      raidtype: 0
++      partitions:
++        - d2p3
++        - d3p3
++    md5:
++      raidtype: 1
++      partitions:
++        - md3
++        - md4
++
++  filesystems:
++    md0:
++      label: ROOT
++      mountpoint: /
++    md1:
++      label: VAR
++      mountpoint: /var
++    md2:
++      label: TMP
++      mountpoint: /tmp
++    md5:
++      label: HOME
++      mountpoint: /home
++    d2p0:
++      fstype: swap
++    d3p0:
++      fstype: swap
+diff --git a/ironic_lib/tests/examples/Rhel_layout_6disk_raid5.yaml b/ironic_lib/tests/examples/Rhel_layout_6disk_raid5.yaml
+new file mode 100644
+index 0000000..a0307e9
+--- /dev/null
++++ b/ironic_lib/tests/examples/Rhel_layout_6disk_raid5.yaml
+@@ -0,0 +1,125 @@
++disk_config:
++  blockdev:
++    disk0:
++      candidates: any
++      partitions:
++        d0p0:
++          size: 4G
++        d0p1:
++          size: 4G
++        d0p2:
++          size: 4G
++        d0p3:
++          minsize: 2G
++    disk1:
++      candidates: any
++      partitions:
++        d1p0:
++          size: 4G
++          type: linux-swap
++        d1p1:
++          size: 4G
++        d1p2:
++          size: 4G
++        d1p3:
++          minsize: 2G
++    disk2:
++      candidates: any
++      partitions:
++        d2p0:
++          size: 4G
++        d2p1:
++          size: 4G
++        d2p2:
++          size: 4G
++        d2p3:
++          minsize: 2G
++    disk3:
++      candidates: any
++      partitions:
++        d3p0:
++          size: 4G
++          type: linux-swap
++        d3p1:
++          size: 4G
++        d3p2:
++          size: 4G
++        d3p3:
++          minsize: 2G
++    disk4:
++      candidates: any
++      partitions:
++        d4p0:
++          size: 4G
++        d4p1:
++          size: 4G
++        d4p2:
++          size: 4G
++        d4p3:
++          minsize: 2G
++    disk5:
++      candidates: any
++      partitions:
++        d5p0:
++          size: 4G
++          type: linux-swap
++        d5p1:
++          size: 4G
++        d5p2:
++          size: 4G
++        d5p3:
++          minsize: 2G
++  swraid:
++    md0:
++      raidtype: 1
++      partitions:
++        - d0p0
++        - d2p0
++        - d4p0
++    md1:
++      raidtype: 5
++      partitions:
++        - d0p1
++        - d1p1
++        - d2p1
++        - d3p1
++        - d4p1
++        - d5p1
++    md2:
++      raidtype: 5
++      partitions:
++        - d0p2
++        - d1p2
++        - d2p2
++        - d3p2
++        - d4p2
++        - d5p2
++    md3:
++      raidtype: 5
++      partitions:
++        - d0p3
++        - d1p3
++        - d2p3
++        - d3p3
++        - d4p3
++        - d5p3
++
++  filesystems:
++    md0:
++      label: ROOT
++      mountpoint: /
++    md1:
++      label: VAR
++      mountpoint: /var
++    md2:
++      label: TMP
++      mountpoint: /tmp
++    md3:
++      label: HOME
++      mountpoint: /home
++    d1p0:
++      fstype: swap
++    d3p0:
++      fstype: swap
++    d5p0:
++      fstype: swap
+diff --git a/ironic_lib/tests/examples/Rhel_layout_cm3_rhel_mysql.yaml b/ironic_lib/tests/examples/Rhel_layout_cm3_rhel_mysql.yaml
+new file mode 100644
+index 0000000..ac85f97
+--- /dev/null
++++ b/ironic_lib/tests/examples/Rhel_layout_cm3_rhel_mysql.yaml
+@@ -0,0 +1,43 @@
++# profile with mkfsopts and mountopts
++disk_config:
++  blockdev:
++    disk0:
++      candidates: any
++      partitions:
++        d0p1:
++          size: 256M
++        d0p2:
++          minsize: 2G
++  lvm:
++    sys:
++      LVs:
++        root:
++          size: 10G
++        swap:
++          size: memsize
++        var:
++          size: 4G
++        tmp:
++          size: 4G
++        home:
++          minsize: 2G
++      PVs:
++        - d0p2
++  filesystems:
++    d0p1:
++      fstype: ext3
++      label: /boot
++      mountpoint: /boot
++    root:
++      mountpoint: /
++    swap:
++      fstype: swap
++    var:
++      mountpoint: /var
++    tmp:
++      mountpoint: /tmp
++    home:
++      fstype: xfs
++      mkfsopts: -d noalign
++      mountopts: noatime,nodiratime,logbufs=8,nobarrier
++      mountpoint: /home
+diff --git a/ironic_lib/tests/examples/example1.yaml b/ironic_lib/tests/examples/example1.yaml
+new file mode 100644
+index 0000000..bf5396e
+--- /dev/null
++++ b/ironic_lib/tests/examples/example1.yaml
+@@ -0,0 +1,39 @@
++disk_config:
++  partition_table: gpt
++  blockdev:
++    sda:
++      candidates: any
++      partitions:
++        d0p1:
++          size: 512M
++        d0p2:
++          minsize: 2G
++  lvm:
++    sys:
++      LVs:
++        home:
++          minsize: 1G
++        root:
++          size: 10G
++        swap:
++          size: memsize
++        var:
++          size: 4G
++        tmp:
++          size: 4G
++      PVs:
++        - d0p2
++  filesystems:
++    d0p1:
++      label: /boot
++      mountpoint: /boot
++    home:
++      mountpoint: /home
++    root:
++      mountpoint: /
++    swap:
++      fstype: swap
++    var:
++      mountpoint: /var
++    tmp:
++      mountpoint: /tmp
+diff --git a/ironic_lib/tests/examples/example_conf1.yaml b/ironic_lib/tests/examples/example_conf1.yaml
+new file mode 100644
+index 0000000..9d8f176
+--- /dev/null
++++ b/ironic_lib/tests/examples/example_conf1.yaml
+@@ -0,0 +1,16 @@
++disk_config:
++  blockdev:
++    sda:
++      candidates:
++        serial: 55cd2e404c02bac5
++      partitions:
++        d0p1:
++          size: 512M
++        d0p2:
++          minsize: 2G
++  filesystems:
++    d0p1:
++      label: /boot
++      mountpoint: /boot
++    d0p2:
++      mountpoint: /
+diff --git a/ironic_lib/tests/examples/m10n_chef.yaml b/ironic_lib/tests/examples/m10n_chef.yaml
+new file mode 100644
+index 0000000..176e9eb
+--- /dev/null
++++ b/ironic_lib/tests/examples/m10n_chef.yaml
+@@ -0,0 +1,22 @@
++disk_config:
++  blockdev:
++    disk0:
++      candidates: any
++      partitions:
++        sda1:
++          size: 8G
++        sda2:
++          size: 2G
++        sda3:
++          minsize: 2G
++  filesystems:
++    sda1:
++      fstype: ext3
++      label: /
++      mountpoint: /
++    sda2:
++      fstype: swap
++    sda3:
++      fstype: ext3
++      label: VAR
++      mountpoint: /var
+diff --git a/ironic_lib/tests/examples/megacli_partitions.yaml b/ironic_lib/tests/examples/megacli_partitions.yaml
+new file mode 100644
+index 0000000..36608ba
+--- /dev/null
++++ b/ironic_lib/tests/examples/megacli_partitions.yaml
+@@ -0,0 +1,26 @@
++disk_config:
++  blockdev:
++    disk0:
++      candidates: any
++    disk1:
++      candidates: any
++    disk2:
++      candidates: any
++    raid0:
++      partitions:
++        p1:
++          size: 512M
++        p2:
++          minsize: 2G
++  hwraid:
++    raid0:
++      raidtype: 0
++      partitions:
++        - disk0
++        - disk1
++        - disk2
++  filesystems:
++    p2:
++      mountpoint: /
++    p1:
++      mountpoint: /boot
+diff --git a/ironic_lib/tests/examples/use_2nd_disk.yaml b/ironic_lib/tests/examples/use_2nd_disk.yaml
+new file mode 100644
+index 0000000..948fd21
+--- /dev/null
++++ b/ironic_lib/tests/examples/use_2nd_disk.yaml
+@@ -0,0 +1,40 @@
++disk_config:
++  blockdev:
++    disk0:
++      candidates: any
++    disk1:
++      candidates: any
++      partitions:
++        d1p1:
++          size: 512M
++        d1p2:
++          minsize: 2G
++  lvm:
++    sys:
++      LVs:
++        home:
++          minsize: 1G
++        root:
++          size: 10G
++        swap:
++          size: memsize
++        var:
++          size: 4G
++        tmp:
++          size: 4G
++      PVs:
++        - d1p2
++  filesystems:
++    d1p1:
++      label: /boot
++      mountpoint: /boot
++    home:
++      mountpoint: /home
++    root:
++      mountpoint: /
++    swap:
++      fstype: swap
++    var:
++      mountpoint: /var
++    tmp:
++      mountpoint: /tmp
+diff --git a/ironic_lib/tests/examples/yse_bnode_4disk.yaml b/ironic_lib/tests/examples/yse_bnode_4disk.yaml
+new file mode 100644
+index 0000000..5226232
+--- /dev/null
++++ b/ironic_lib/tests/examples/yse_bnode_4disk.yaml
+@@ -0,0 +1,111 @@
++disk_config:
++  blockdev:
++    disk0:
++      candidates: any
++      partitions:
++        d0p1:
++          size: 1G
++        d0p2:
++          size: 48G
++          type: linux-swap
++        d0p3:
++          size: 32G
++        d0p4:
++          size: 30G
++        d0p5:
++          minsize: 2G
++    disk1:
++      candidates: any
++      partitions:
++        d1p1:
++          size: 1G
++        d1p2:
++          size: 48G
++          type: linux-swap
++        d1p3:
++          size: 32G
++        d1p4:
++          size: 30G
++        d1p5:
++          minsize: 2G
++    disk2:
++      candidates: any
++      partitions:
++        d2p1:
++          size: 1G
++        d2p2:
++          size: 48G
++          type: linux-swap
++        d2p3:
++          size: 32G
++        d2p4:
++          size: 30G
++        d2p5:
++          minsize: 2G
++    disk3:
++      candidates: any
++      partitions:
++        d3p1:
++          size: 1G
++        d3p2:
++          size: 48G
++          type: linux-swap
++        d3p3:
++          size: 32G
++        d3p4:
++          size: 30G
++        d3p5:
++          minsize: 2G
++  swraid:
++    md3:
++      raidtype: 0
++      partitions:
++        - d0p3
++        - d1p3
++        - d2p3
++        - d3p3
++    md4:
++      raidtype: 0
++      partitions:
++        - d0p4
++        - d1p4
++        - d2p4
++        - d3p4
++    md5:
++      raidtype: 0
++      partitions:
++        - d0p5
++        - d1p5
++        - d2p5
++        - d3p5
++  filesystems:
++    d0p1:
++      mountpoint: /boot
++      label: BOOT
++    md3:
++      fstype: xfs
++      mountopts: noatime,inode64
++      mountpoint: /
++      label: ROOT
++    md4:
++      fstype: xfs
++      mountopts: noatime,inode64
++      mountpoint: /home
++      label: HOME
++    md5:
++      fstype: xfs
++      mountopts: noatime,inode64
++      mountpoint: /export/crawlspace
++      label: EXCR
++    d0p2:
++      fstype: swap
++      mountopts: 'defaults,pri=1'
++    d1p2:
++      fstype: swap
++      mountopts: 'defaults,pri=1'
++    d2p2:
++      fstype: swap
++      mountopts: 'defaults,pri=1'
++    d3p2:
++      fstype: swap
++      mountopts: 'defaults,pri=1'
+diff --git a/ironic_lib/tests/examples/yse_bnode_4disk_gpt.yaml b/ironic_lib/tests/examples/yse_bnode_4disk_gpt.yaml
+new file mode 100644
+index 0000000..a3eeaef
+--- /dev/null
++++ b/ironic_lib/tests/examples/yse_bnode_4disk_gpt.yaml
+@@ -0,0 +1,115 @@
++disk_config:
++  partition_table: gpt
++  blockdev:
++    disk0:
++      candidates: any
++      partitions:
++        bios:
++          size: 200M
++        d0p1:
++          size: 800M
++        d0p2:
++          size: 48G
++          type: linux-swap
++        d0p3:
++          size: 32G
++        d0p4:
++          size: 30G
++        d0p5:
++          minsize: 2G
++    disk1:
++      candidates: any
++      partitions:
++        d1p1:
++          size: 1G
++        d1p2:
++          size: 48G
++          type: linux-swap
++        d1p3:
++          size: 32G
++        d1p4:
++          size: 30G
++        d1p5:
++          minsize: 2G
++    disk2:
++      candidates: any
++      partitions:
++        d2p1:
++          size: 1G
++        d2p2:
++          size: 48G
++          type: linux-swap
++        d2p3:
++          size: 32G
++        d2p4:
++          size: 30G
++        d2p5:
++          minsize: 2G
++    disk3:
++      candidates: any
++      partitions:
++        d3p1:
++          size: 1G
++        d3p2:
++          size: 48G
++          type: linux-swap
++        d3p3:
++          size: 32G
++        d3p4:
++          size: 30G
++        d3p5:
++          minsize: 2G
++  swraid:
++    md3:
++      raidtype: 0
++      partitions:
++        - d0p3
++        - d1p3
++        - d2p3
++        - d3p3
++    md4:
++      raidtype: 0
++      partitions:
++        - d0p4
++        - d1p4
++        - d2p4
++        - d3p4
++    md5:
++      raidtype: 0
++      partitions:
++        - d0p5
++        - d1p5
++        - d2p5
++        - d3p5
++  filesystems:
++    bios:
++      label: BOOT
++    d0p1:
++      mountpoint: /boot
++    md3:
++      fstype: xfs
++      mountopts: noatime,inode64
++      mountpoint: /
++      label: ROOT
++    md4:
++      fstype: xfs
++      mountopts: noatime,inode64
++      mountpoint: /home
++      label: HOME
++    md5:
++      fstype: xfs
++      mountopts: noatime,inode64
++      mountpoint: /export/crawlspace
++      label: EXCR
++    d0p2:
++      fstype: swap
++      mountopts: 'defaults,pri=1'
++    d1p2:
++      fstype: swap
++      mountopts: 'defaults,pri=1'
++    d2p2:
++      fstype: swap
++      mountopts: 'defaults,pri=1'
++    d3p2:
++      fstype: swap
++      mountopts: 'defaults,pri=1'
+diff --git a/ironic_lib/tests/examples/yse_bnode_fsprofile.yaml b/ironic_lib/tests/examples/yse_bnode_fsprofile.yaml
+new file mode 100644
+index 0000000..6f9785d
+--- /dev/null
++++ b/ironic_lib/tests/examples/yse_bnode_fsprofile.yaml
+@@ -0,0 +1,114 @@
++disk_config:
++  blockdev:
++    disk0:
++      candidates: any
++      partitions:
++        d0p1:
++          size: 1G
++        d0p2:
++          size: 48G
++          type: linux-swap
++        d0p3:
++          size: 32G
++        d0p4:
++          size: 128G
++        d0p5:
++          minsize: 2G
++    disk1:
++      candidates: any
++      partitions:
++        d1p1:
++          size: 1G
++        d1p2:
++          size: 48G
++          type: linux-swap
++        d1p3:
++          size: 32G
++        d1p4:
++          size: 128G
++        d1p5:
++          minsize: 2G
++    disk2:
++      candidates: any
++      partitions:
++        d2p1:
++          size: 1G
++        d2p2:
++          size: 48G
++          type: linux-swap
++        d2p3:
++          size: 32G
++        d2p4:
++          size: 128G
++        d2p5:
++          minsize: 2G
++    disk3:
++      candidates: any
++      partitions:
++        d3p1:
++          size: 1G
++        d3p2:
++          size: 48G
++          type: linux-swap
++        d3p3:
++          size: 32G
++        d3p4:
++          size: 128G
++        d3p5:
++          minsize: 2G
++  swraid:
++    md3:
++      raidtype: 0
++      partitions:
++        - d0p3
++        - d1p3
++        - d2p3
++        - d3p3
++    md4:
++      raidtype: 0
++      partitions:
++        - d0p4
++        - d1p4
++        - d2p4
++        - d3p4
++    md5:
++      raidtype: 0
++      partitions:
++        - d0p5
++        - d1p5
++        - d2p5
++        - d3p5
++  filesystems:
++    d0p1:
++      mountpoint: /boot
++      label: BOOT
++    md3:
++      fstype: ext4
++      mkfsopts: -E lazy_itable_init=1 -O uninit_bg
++      mountopts: 'defaults,noatime,nodiratime'
++      mountpoint: /
++      label: ROOT
++    md4:
++      fstype: ext4
++      mkfsopts: -E lazy_itable_init=1 -O uninit_bg
++      mountopts: 'defaults,noatime,nodiratime'
++      mountpoint: /home
++      label: HOME
++    md5:
++      fstype: ext4
++      mkfsopts: -E lazy_itable_init=1 -O uninit_bg
++      mountopts: 'defaults,noatime,nodiratime'
++      mountpoint: /export/crawlspace
++      label: EXCR
++    d0p2:
++      fstype: swap
++      mountopts: 'defaults,pri=1'
++    d1p2:
++      fstype: swap
++      mountopts: 'defaults,pri=1'
++    d2p2:
++      fstype: swap
++      mountopts: 'defaults,pri=1'
++    d3p2:
++      fstype: swap
++      mountopts: 'defaults,pri=1'
+diff --git a/ironic_lib/tests/test_examples.py b/ironic_lib/tests/test_examples.py
+new file mode 100644
+index 0000000..05b5cc7
+--- /dev/null
++++ b/ironic_lib/tests/test_examples.py
+@@ -0,0 +1,79 @@
++# Copyright (c) 2018 Intel Corporation
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++# implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from oslotest import base as test_base
++
++from ironic_lib.system_installer import SystemInstaller
++
++EXAMPLES_DIR = 'ironic_lib/tests/examples/'
++
++
++class SystemInstallerExamplesTestCase(test_base.BaseTestCase):
++
++    def test_example1(self):
++        y = SystemInstaller(open(EXAMPLES_DIR + 'example1.yaml').read())
++        y.validate_conf()
++
++    def test_disk_openhouse_preserve_hv(self):
++        y = SystemInstaller(
++            open(EXAMPLES_DIR + 'Disk_openhouse_preserve_hv.yaml').read())
++        y.validate_conf()
++
++    def test_rhel_layout_1disk_1partition(self):
++        y = SystemInstaller(
++            open(EXAMPLES_DIR + 'Rhel_layout_1disk_1partition.yaml').read())
++        y.validate_conf()
++
++    def test_rhel_layout_4disk_raid10(self):
++        y = SystemInstaller(
++            open(EXAMPLES_DIR + 'Rhel_layout_4disk_raid10.yaml').read())
++        y.validate_conf()
++
++    def test_rhel_layout_cm3_rhel_mysql(self):
++        y = SystemInstaller(
++            open(EXAMPLES_DIR + 'Rhel_layout_cm3_rhel_mysql.yaml').read())
++        y.validate_conf()
++
++    def test_rhel_layout_6disk_raid5(self):
++        y = SystemInstaller(
++            open(EXAMPLES_DIR + 'Rhel_layout_6disk_raid5.yaml').read())
++        y.validate_conf()
++
++    def test_m10n_chef(self):
++        y = SystemInstaller(open(EXAMPLES_DIR + 'm10n_chef.yaml').read())
++        y.validate_conf()
++
++    def test_use_2nd_disk(self):
++        y = SystemInstaller(open(EXAMPLES_DIR + 'use_2nd_disk.yaml').read())
++        y.validate_conf()
++
++    def test_yse_bnode_4disk(self):
++        y = SystemInstaller(open(EXAMPLES_DIR + 'yse_bnode_4disk.yaml').read())
++        y.validate_conf()
++
++    def test_yse_bnode_4disk_gpt(self):
++        y = SystemInstaller(
++            open(EXAMPLES_DIR + 'yse_bnode_4disk_gpt.yaml').read())
++        y.validate_conf()
++
++    def test_yse_bnode_fsprofile(self):
++        y = SystemInstaller(
++            open(EXAMPLES_DIR + 'yse_bnode_fsprofile.yaml').read())
++        y.validate_conf()
++
++    def test_megacli_partitions(self):
++        y = SystemInstaller(
++            open(EXAMPLES_DIR + 'megacli_partitions.yaml').read())
++        y.validate_conf()
+diff --git a/ironic_lib/tests/test_system_installer.py b/ironic_lib/tests/test_system_installer.py
+new file mode 100644
+index 0000000..ac95b7d
+--- /dev/null
++++ b/ironic_lib/tests/test_system_installer.py
+@@ -0,0 +1,976 @@
++# Copyright (c) 2018 Intel Corporation
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++# implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import json
++import unittest
++
++import mock
++
++from ironic_lib import system_installer as si
++from ironic_lib.system_installer.exceptions import ConfError
++from ironic_lib.system_installer.exceptions import EnvError
++from ironic_lib.system_installer.filesystemsetup import FilesystemSetup
++from ironic_lib.system_installer.hpssaclisetup import HpSsaCliSetup
++from ironic_lib.system_installer.lvmsetup import LvmSetup
++from ironic_lib.system_installer.megaclisetup import MegaCliSetup
++from ironic_lib.system_installer.partitionsetup import PartitionSetup
++from ironic_lib.system_installer.swraidsetup import SwRaidSetup
++from ironic_lib.system_installer.systemsetup import SystemSetup
++
++
++class TestSystemInstallerValidateConf(unittest.TestCase):
++
++    def test_validate_conf_fail_on_json_error(self):
++        cfg_dict = {'disk_config': ['some', 'wrong', 'values']}
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        self.assertRaises(ConfError, sysinst.validate_conf)
++
++    @mock.patch.object(MegaCliSetup, 'validate_conf')
++    def test_validate_conf_fail_on_hwraid_setup(self, ms):
++        ms.side_effect = ConfError
++        cfg_dict = {'disk_config': {'hwraid': ['some', 'wrong', 'values']}}
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        self.assertRaises(ConfError, sysinst.validate_conf)
++
++    @mock.patch.object(FilesystemSetup, 'validate_conf')
++    def test_validate_conf_fail_on_fs_setup(self, fs):
++        fs.side_effect = ConfError
++        cfg_dict = {'disk_config': {'filesystems': ['some', 'wrong',
++                                                    'values']}}
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        self.assertRaises(ConfError, sysinst.validate_conf)
++
++    @mock.patch.object(LvmSetup, 'validate_conf')
++    @mock.patch.object(FilesystemSetup, 'validate_conf')
++    def test_validate_conf_fail_on_lvm_setup(self, fs, ls):
++        ls.side_effect = ConfError
++        cfg_dict = {'disk_config': {'filesystems': {},
++                                    'lvm': ['some', 'wrong', 'values']}}
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        self.assertRaises(ConfError, sysinst.validate_conf)
++
++    @mock.patch.object(LvmSetup, 'get_src_names')
++    @mock.patch.object(LvmSetup, 'validate_conf')
++    @mock.patch.object(FilesystemSetup, 'validate_conf')
++    def test_get_src_names_fail_on_lvm_setup(self, fs, ls, lsrc):
++        lsrc.side_effect = ConfError
++        cfg_dict = {'disk_config': {'filesystems': {},
++                                    'lvm': {'sys': ['some', 'wrong',
++                                                    'values']}}}
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        self.assertRaises(ConfError, sysinst.validate_conf)
++
++    @mock.patch.object(LvmSetup, 'get_dst_names')
++    @mock.patch.object(LvmSetup, 'get_src_names')
++    @mock.patch.object(LvmSetup, 'validate_conf')
++    @mock.patch.object(FilesystemSetup, 'validate_conf')
++    def test_get_dst_names_fail_on_lvm_setup(self, fs, ls, lsrc, ldst):
++        ldst.side_effect = ConfError
++        cfg_dict = {'disk_config': {'filesystems': {},
++                                    'lvm': {'sys': ['some', 'wrong',
++                                                    'values']}}}
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        self.assertRaises(ConfError, sysinst.validate_conf)
++
++    @mock.patch.object(SwRaidSetup, 'validate_conf')
++    @mock.patch.object(FilesystemSetup, 'validate_conf')
++    def test_validate_conf_fail_on_softraid_setup(self, fs, ss):
++        ss.side_effect = ConfError
++        cfg_dict = {'disk_config': {'filesystems': {},
++                                    'swraid': ['some', 'wrong', 'values']}}
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        self.assertRaises(ConfError, sysinst.validate_conf)
++
++    @mock.patch.object(SwRaidSetup, 'get_dst_names')
++    @mock.patch.object(SwRaidSetup, 'validate_conf')
++    @mock.patch.object(FilesystemSetup, 'validate_conf')
++    def test_get_dst_names_fail_on_softraid_setup(self, fs, ss, sdst):
++        sdst.side_effect = AttributeError
++        cfg_dict = {
++            'disk_config': {
++                "blockdev": {
++                    "sda": {
++                        "candidates": "any",
++                        "partitions": {
++                            "d0p1": {"size": "512M"},
++                            "d0p2": {
++                                "minsize": "2G"
++                            }
++                        }
++                    }
++                },
++                'filesystems': {},
++                'swraid': {
++                    'md0': {
++                        'partitions': ['a', 'b', 'c'],
++                        'raidtype': 1
++                    }
++                }
++            }
++        }
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        self.assertRaises(AttributeError, sysinst.validate_conf)
++
++    @mock.patch.object(SwRaidSetup, 'get_src_names')
++    @mock.patch.object(SwRaidSetup, 'get_dst_names')
++    @mock.patch.object(SwRaidSetup, 'validate_conf')
++    @mock.patch.object(FilesystemSetup, 'validate_conf')
++    def test_get_src_names_fail_on_softraid_setup(self, fs, ss, sdst, ssrc):
++        ssrc.side_effect = AttributeError
++        cfg_dict = {
++            'disk_config': {
++                "blockdev": {
++                    "sda": {
++                        "candidates": "any",
++                        "partitions": {
++                            "d0p1": {
++                                "size": "512M"
++                            },
++                            "d0p2": {
++                                "minsize": "2G"
++                            }
++                        }
++                    }
++                },
++                'filesystems': {},
++                'swraid': {
++                    'md0': {
++                        'partitions': ['a', 'b', 'c'],
++                        'raidtype': 1
++                    }
++                }
++            }
++        }
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        self.assertRaises(AttributeError, sysinst.validate_conf)
++
++    @mock.patch.object(PartitionSetup, 'validate_conf')
++    @mock.patch.object(FilesystemSetup, 'validate_conf')
++    def test_validate_conf_fail_on_part_setup(self, fs, ps):
++        ps.side_effect = ConfError
++        cfg_dict = {'disk_config': {'filesystems': {},
++                                    'blockdev': {}}}
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        self.assertRaises(ConfError, sysinst.validate_conf)
++
++    @mock.patch.object(PartitionSetup, 'validate_conf')
++    @mock.patch.object(FilesystemSetup, 'validate_conf')
++    def test_validate_conf_pass_on_empty_conf(self, fs, ps):
++        cfg_dict = {'disk_config': {'filesystems': {},
++                                    'blockdev': {}}}
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        self.assertIsNone(sysinst.validate_conf())
++
++    def test_validate_conf_fail_on_wrong_fs_part_map(self):
++        cfg_dict = {'disk_config': {'filesystems': {'/': {'mountpoint': '/'}},
++                                    'blockdev': {}}}
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        self.assertRaises(ConfError, sysinst.validate_conf)
++
++    def test_validate_conf_fail_on_wrong_lvm_part_map(self):
++        cfg_dict = {
++            'disk_config': {
++                'filesystems': {
++                    'home': {'mountpoint': '/'}
++                },
++                'blockdev': {},
++                'lvm': {
++                    'sys': {
++                        'LVs': {
++                            'home': {'minsize': '1G'}
++                        },
++                        'PVs': ['d0p2']
++                    }
++                }
++            }
++        }
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        self.assertRaises(ConfError, sysinst.validate_conf)
++
++    def test_validate_conf_fail_on_wrong_raid_part_map(self):
++        # sdst.side_effect = [['d0p1']]
++        cfg_dict = {
++            'disk_config': {
++                'filesystems': {
++                    'md0': {'mountpoint': '/'}
++                },
++                'blockdev': {
++                    'disk0': {
++                        'd0p0': {
++                            'candidates': 'any'
++                        }
++                    },
++                    'disk1': {
++                        'd1p0': {
++                            'candidates': 'any'
++                        }
++                    }
++                },
++                'swraid': {
++                    'md0': {
++                        'raidtype': 1,
++                        'partitions': ['d0p0', 'd1p1']
++                    }
++                }
++            }
++        }
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        self.assertRaises(ConfError, sysinst.validate_conf)
++
++    @unittest.skip('Validating MegaCli not implemented yet')
++    def test_validate_conf_megaraid(self):
++        cfg_dict = {
++            'disk_config': {
++                'hwraid': {
++                    'raid0': {
++                        'raidtype': 0,
++                        'partitions': ['disk0', 'disk1']
++                    }
++                },
++                'blockdev': {
++                    'disk0': {
++                        'candidates': 'any'
++                    },
++                    'disk1': {
++                        'candidates': 'any'
++                    },
++                    'raid0': {
++                        'partitons': {
++                            'p1': {
++                                'minsize': '2G',
++                            }
++                        }
++                    }
++                },
++                'filesystems': {
++                    'p1': {'mountpoint': '/'}
++                },
++            }
++        }
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        sysinst.validate_conf()
++
++
++class TestSystemInstallerValidateEnv(unittest.TestCase):
++
++    @mock.patch.object(SystemSetup, 'validate_env')
++    @mock.patch.object(FilesystemSetup, 'validate_env')
++    def test_validate_env_preserve_on_dummy_config(self, fs, sys):
++        cfg_dict = {'disk_config': {}}
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++
++        sysinst.validate_env_preserve()
++
++        fs.assert_not_called()
++        sys.assert_not_called()
++
++    @mock.patch.object(SystemSetup, 'validate_env')
++    @mock.patch.object(FilesystemSetup, 'validate_env')
++    def test_validate_env_preserve_on_filesystems(self, fs, sys):
++        cfg_dict = {'disk_config': {'filesystems': {}}}
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++
++        sysinst.validate_env_preserve()
++
++        fs.assert_called()
++        sys.assert_called()
++
++    @mock.patch.object(SystemSetup, 'validate_env')
++    @mock.patch.object(SwRaidSetup, 'validate_env')
++    @mock.patch.object(MegaCliSetup, 'validate_env')
++    @mock.patch.object(HpSsaCliSetup, 'validate_env')
++    @mock.patch.object(PartitionSetup, 'validate_env')
++    @mock.patch.object(LvmSetup, 'validate_env')
++    @mock.patch.object(FilesystemSetup, 'validate_env')
++    def test_validate_env_on_dummy_config(self, fs, ls, ps, hp, ms, ss, sys):
++        cfg_dict = {'disk_config': {}}
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++
++        sysinst.validate_env()
++
++        fs.assert_not_called()
++        ls.assert_not_called()
++        ps.assert_not_called()
++        ms.assert_not_called()
++        ss.assert_not_called()
++        hp.assert_not_called()
++        sys.assert_not_called()
++
++    @mock.patch.object(SystemSetup, 'validate_env')
++    @mock.patch.object(SwRaidSetup, 'validate_env')
++    @mock.patch.object(MegaCliSetup, 'validate_env')
++    @mock.patch.object(HpSsaCliSetup, 'validate_env')
++    @mock.patch.object(PartitionSetup, 'validate_env')
++    @mock.patch.object(LvmSetup, 'validate_env')
++    @mock.patch.object(FilesystemSetup, 'validate_env')
++    def test_validate_env_on_lvm_config(self, fs, ls, ps, hp, ms, ss, sys):
++        cfg_dict = {
++            'disk_config': {
++                'lvm': {
++                    'sys': {
++                        'LVs': {
++                            'home': {'minsize': '1G'}
++                        },
++                        'PVs': ['d0p2']
++                    }
++                }
++            }
++        }
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++
++        sysinst.validate_env()
++
++        fs.assert_not_called()
++        ls.assert_called_once()
++        ps.assert_not_called()
++        ms.assert_not_called()
++        hp.assert_not_called()
++        ss.assert_not_called()
++        sys.assert_not_called()
++
++    @mock.patch.object(SystemSetup, 'validate_env')
++    @mock.patch.object(SwRaidSetup, 'validate_env')
++    @mock.patch.object(MegaCliSetup, 'validate_env')
++    @mock.patch.object(HpSsaCliSetup, 'validate_env')
++    @mock.patch.object(PartitionSetup, 'validate_env')
++    @mock.patch.object(LvmSetup, 'validate_env')
++    @mock.patch.object(FilesystemSetup, 'validate_env')
++    def test_validate_env_on_swraid_config(self, fs, ls, ps, hp, ms, ss, sys):
++        cfg_dict = {
++            'disk_config': {
++                'swraid': {
++                    'md0': {
++                        'raidtype': 1,
++                        'partitions': ['d0p0', 'd1p1']
++                    }
++                }
++            }
++        }
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++
++        sysinst.validate_env()
++
++        fs.assert_not_called()
++        ls.assert_not_called()
++        ps.assert_not_called()
++        ms.assert_not_called()
++        hp.assert_not_called()
++        ss.assert_called_once()
++        sys.assert_not_called()
++
++    @mock.patch.object(SystemSetup, 'validate_env')
++    @mock.patch.object(SwRaidSetup, 'validate_env')
++    @mock.patch.object(MegaCliSetup, 'validate_env')
++    @mock.patch.object(HpSsaCliSetup, 'validate_env')
++    @mock.patch.object(PartitionSetup, 'validate_env')
++    @mock.patch.object(LvmSetup, 'validate_env')
++    @mock.patch.object(FilesystemSetup, 'validate_env')
++    def test_validate_env_on_partsetup_config(self, fs, ls, ps, hp, ms, ss,
++                                              sys):
++        cfg_dict = {
++            'disk_config': {
++                'blockdev': {
++                    'disk0': {
++                        'd0p0': {
++                            'candidates': 'any'
++                        }
++                    },
++                    'disk1': {
++                        'd1p0': {
++                            'candidates': 'any'
++                        }
++                    },
++                }
++            }
++        }
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++
++        sysinst.validate_env()
++
++        fs.assert_not_called()
++        ls.assert_not_called()
++        ps.assert_called_once()
++        ms.assert_not_called()
++        hp.assert_not_called()
++        ss.assert_not_called()
++        sys.assert_not_called()
++
++    @mock.patch.object(HpSsaCliSetup, 'is_hpraid_controller')
++    @mock.patch.object(MegaCliSetup, 'is_megacli_controller')
++    @mock.patch.object(SystemSetup, 'validate_env')
++    @mock.patch.object(SwRaidSetup, 'validate_env')
++    @mock.patch.object(MegaCliSetup, 'validate_env')
++    @mock.patch.object(HpSsaCliSetup, 'validate_env')
++    @mock.patch.object(PartitionSetup, 'validate_env')
++    @mock.patch.object(LvmSetup, 'validate_env')
++    @mock.patch.object(FilesystemSetup, 'validate_env')
++    def test_validate_env_on_hwraid_config_megacli(self, fs, ls, ps, hp, ms,
++                                                   ss, sys, is_megacli,
++                                                   is_hpraid):
++        cfg_dict = {
++            'disk_config': {
++                'hwraid': {
++                    'raid0': {
++                        'raidtype': 5,
++                        'partitions': ['disk0', 'disk1']
++                    }
++                }
++            }
++        }
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        is_megacli.return_value = True
++        is_hpraid.return_value = False
++
++        sysinst.validate_env()
++
++        fs.assert_not_called()
++        ls.assert_not_called()
++        ps.assert_not_called()
++        ms.assert_called_once()
++        hp.assert_not_called()
++        ss.assert_not_called()
++        sys.assert_not_called()
++
++    @mock.patch.object(HpSsaCliSetup, 'is_hpraid_controller')
++    @mock.patch.object(MegaCliSetup, 'is_megacli_controller')
++    @mock.patch.object(SystemSetup, 'validate_env')
++    @mock.patch.object(SwRaidSetup, 'validate_env')
++    @mock.patch.object(MegaCliSetup, 'validate_env')
++    @mock.patch.object(HpSsaCliSetup, 'validate_env')
++    @mock.patch.object(PartitionSetup, 'validate_env')
++    @mock.patch.object(LvmSetup, 'validate_env')
++    @mock.patch.object(FilesystemSetup, 'validate_env')
++    def test_validate_env_on_hwraid_config_hpraid(self, fs, ls, ps, hp, ms,
++                                                  ss, sys, is_megacli,
++                                                  is_hpraid):
++        cfg_dict = {
++            'disk_config': {
++                'hwraid': {
++                    'raid0': {
++                        'raidtype': 5,
++                        'partitions': ['disk0', 'disk1']
++                    }
++                }
++            }
++        }
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        is_megacli.return_value = False
++        is_hpraid.return_value = True
++
++        sysinst.validate_env()
++
++        fs.assert_not_called()
++        ls.assert_not_called()
++        ps.assert_not_called()
++        ms.assert_not_called()
++        hp.assert_called_once()
++        ss.assert_not_called()
++        sys.assert_not_called()
++
++    @mock.patch.object(HpSsaCliSetup, 'is_hpraid_controller')
++    @mock.patch.object(MegaCliSetup, 'is_megacli_controller')
++    @mock.patch.object(SystemSetup, 'validate_env')
++    @mock.patch.object(SwRaidSetup, 'validate_env')
++    @mock.patch.object(MegaCliSetup, 'validate_env')
++    @mock.patch.object(HpSsaCliSetup, 'validate_env')
++    @mock.patch.object(PartitionSetup, 'validate_env')
++    @mock.patch.object(LvmSetup, 'validate_env')
++    @mock.patch.object(FilesystemSetup, 'validate_env')
++    def test_validate_env_on_hwraid_config_fails(self, fs, ls, ps, hp, ms,
++                                                 ss, sys, is_megacli,
++                                                 is_hpraid):
++        cfg_dict = {
++            'disk_config': {
++                'hwraid': {
++                    'raid0': {
++                        'raidtype': 5,
++                        'partitions': ['disk0', 'disk1']
++                    }
++                }
++            }
++        }
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        is_megacli.return_value = False
++        is_hpraid.return_value = False
++
++        with self.assertRaises(EnvError):
++            sysinst.validate_env()
++
++        fs.assert_not_called()
++        ls.assert_not_called()
++        ps.assert_not_called()
++        ms.assert_not_called()
++        hp.assert_not_called()
++        ss.assert_not_called()
++        sys.assert_not_called()
++
++
++class TestSystemInstallerCleanDisks(unittest.TestCase):
++
++    @mock.patch.object(SystemSetup, 'clean_disks')
++    @mock.patch.object(SwRaidSetup, 'clean_disks')
++    @mock.patch.object(MegaCliSetup, 'clean_disks')
++    @mock.patch.object(HpSsaCliSetup, 'clean_disks')
++    @mock.patch.object(PartitionSetup, 'clean_disks')
++    @mock.patch.object(LvmSetup, 'clean_disks')
++    @mock.patch.object(FilesystemSetup, 'clean_disks')
++    def test_clean_disks_on_dummy_config(self, fs, ls, ps, hp, ms, ss, sys):
++        cfg_dict = {'disk_config': {}}
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++
++        sysinst.validate_env()
++
++        fs.assert_not_called()
++        ls.assert_not_called()
++        ps.assert_not_called()
++        ms.assert_not_called()
++        hp.assert_not_called()
++        ss.assert_not_called()
++        sys.assert_not_called()
++
++    @mock.patch.object(MegaCliSetup, 'is_megacli_controller')
++    @mock.patch.object(HpSsaCliSetup, 'is_hpraid_controller')
++    @mock.patch.object(SystemSetup, 'clean_disks')
++    @mock.patch.object(SwRaidSetup, 'clean_disks')
++    @mock.patch.object(MegaCliSetup, 'clean_disks')
++    @mock.patch.object(HpSsaCliSetup, 'clean_disks')
++    @mock.patch.object(PartitionSetup, 'clean_disks')
++    @mock.patch.object(LvmSetup, 'clean_disks')
++    @mock.patch.object(FilesystemSetup, 'clean_disks')
++    def test_clean_disks_on_lvm_config(self, fs, ls, ps, hp, ms, ss, sys,
++                                       is_hpraid, is_megacli):
++        is_hpraid.return_value = False
++        is_megacli.return_value = False
++        cfg_dict = {
++            'disk_config': {
++                'lvm': {
++                    'sys': {
++                        'LVs': {
++                            'home': {'minsize': '1G'}
++                        },
++                        'PVs': ['d0p2']
++                    }
++                }
++            }
++        }
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++
++        sysinst.clean_disks()
++
++        fs.assert_called_once()
++        ls.assert_called_once()
++        ps.assert_called_once()
++        ms.assert_not_called()
++        hp.assert_not_called()
++        ss.assert_called_once()
++        sys.assert_called_once()
++
++    @mock.patch.object(MegaCliSetup, 'is_megacli_controller')
++    @mock.patch.object(HpSsaCliSetup, 'is_hpraid_controller')
++    @mock.patch.object(SystemSetup, 'clean_disks')
++    @mock.patch.object(SwRaidSetup, 'clean_disks')
++    @mock.patch.object(MegaCliSetup, 'clean_disks')
++    @mock.patch.object(HpSsaCliSetup, 'clean_disks')
++    @mock.patch.object(PartitionSetup, 'clean_disks')
++    @mock.patch.object(LvmSetup, 'clean_disks')
++    @mock.patch.object(FilesystemSetup, 'clean_disks')
++    def test_clean_disks_on_swraid_config(self, fs, ls, ps, hp, ms, ss, sys,
++                                          is_hpraid, is_megacli):
++        is_hpraid.return_value = False
++        is_megacli.return_value = False
++        cfg_dict = {
++            'disk_config': {
++                'swraid': {
++                    'md0': {
++                        'raidtype': 1,
++                        'partitions': ['d0p0', 'd1p1']
++                    }
++                }
++            }
++        }
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++
++        sysinst.clean_disks()
++
++        fs.assert_called_once()
++        ls.assert_called_once()
++        ps.assert_called_once()
++        ms.assert_not_called()
++        hp.assert_not_called()
++        ss.assert_called_once()
++        sys.assert_called_once()
++
++    @mock.patch.object(MegaCliSetup, 'is_megacli_controller')
++    @mock.patch.object(HpSsaCliSetup, 'is_hpraid_controller')
++    @mock.patch.object(SystemSetup, 'clean_disks')
++    @mock.patch.object(SwRaidSetup, 'clean_disks')
++    @mock.patch.object(MegaCliSetup, 'clean_disks')
++    @mock.patch.object(HpSsaCliSetup, 'clean_disks')
++    @mock.patch.object(PartitionSetup, 'clean_disks')
++    @mock.patch.object(LvmSetup, 'clean_disks')
++    @mock.patch.object(FilesystemSetup, 'clean_disks')
++    def test_clean_disks_on_partsetup_config(self, fs, ls, ps, hp, ms, ss,
++                                             sys, is_hpraid, is_megacli):
++        is_hpraid.return_value = False
++        is_megacli.return_value = False
++        cfg_dict = {
++            'disk_config': {
++                'blockdev': {
++                    'disk0': {
++                        'd0p0': {
++                            'candidates': 'any'
++                        }
++                    },
++                    'disk1': {
++                        'd1p0': {
++                            'candidates': 'any'
++                        }
++                    },
++                }
++            }
++        }
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++
++        sysinst.clean_disks()
++
++        fs.assert_called_once()
++        ls.assert_called_once()
++        ps.assert_called_once()
++        ms.assert_not_called()
++        hp.assert_not_called()
++        ss.assert_called_once()
++        sys.assert_called_once()
++
++    @mock.patch.object(MegaCliSetup, 'is_megacli_controller')
++    @mock.patch.object(HpSsaCliSetup, 'is_hpraid_controller')
++    @mock.patch.object(SystemSetup, 'clean_disks')
++    @mock.patch.object(SwRaidSetup, 'clean_disks')
++    @mock.patch.object(MegaCliSetup, 'clean_disks')
++    @mock.patch.object(HpSsaCliSetup, 'clean_disks')
++    @mock.patch.object(PartitionSetup, 'clean_disks')
++    @mock.patch.object(LvmSetup, 'clean_disks')
++    @mock.patch.object(FilesystemSetup, 'clean_disks')
++    def test_clean_disks_on_syssetup_config_megacli(self, fs, ls, ps, hp, ms,
++                                                    ss, sys, is_hpraid,
++                                                    is_megacli):
++        cfg_dict = {
++            'disk_config': {
++                'hwraid': {
++                    'raid0': {
++                        'raidtype': 5,
++                        'partitions': ['disk0', 'disk1']
++                    }
++                }
++            }
++        }
++        is_hpraid.return_value = False
++        is_megacli.return_value = True
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++
++        sysinst.clean_disks()
++
++        fs.assert_called_once()
++        ls.assert_called_once()
++        ps.assert_called_once()
++        hp.assert_not_called()
++        ms.assert_called_once()
++        ss.assert_called_once()
++        sys.assert_called_once()
++
++    @mock.patch.object(MegaCliSetup, 'is_megacli_controller')
++    @mock.patch.object(HpSsaCliSetup, 'is_hpraid_controller')
++    @mock.patch.object(SystemSetup, 'clean_disks')
++    @mock.patch.object(SwRaidSetup, 'clean_disks')
++    @mock.patch.object(MegaCliSetup, 'clean_disks')
++    @mock.patch.object(HpSsaCliSetup, 'clean_disks')
++    @mock.patch.object(PartitionSetup, 'clean_disks')
++    @mock.patch.object(LvmSetup, 'clean_disks')
++    @mock.patch.object(FilesystemSetup, 'clean_disks')
++    def test_clean_disks_on_syssetup_config_hpraid(self, fs, ls, ps, hp, ms,
++                                                   ss, sys, is_hpraid,
++                                                   is_megacli):
++        cfg_dict = {
++            'disk_config': {
++                'hwraid': {
++                    'raid0': {
++                        'raidtype': 5,
++                        'partitions': ['disk0', 'disk1']
++                    }
++                }
++            }
++        }
++        is_hpraid.return_value = True
++        is_megacli.return_value = False
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++
++        sysinst.clean_disks()
++
++        fs.assert_called_once()
++        ls.assert_called_once()
++        ps.assert_called_once()
++        hp.assert_called_once()
++        ms.assert_not_called()
++        ss.assert_called_once()
++        sys.assert_called_once()
++
++    @mock.patch.object(MegaCliSetup, 'is_megacli_controller')
++    @mock.patch.object(HpSsaCliSetup, 'is_hpraid_controller')
++    @mock.patch.object(SystemSetup, 'clean_disks')
++    @mock.patch.object(SwRaidSetup, 'clean_disks')
++    @mock.patch.object(MegaCliSetup, 'clean_disks')
++    @mock.patch.object(HpSsaCliSetup, 'clean_disks')
++    @mock.patch.object(PartitionSetup, 'clean_disks')
++    @mock.patch.object(LvmSetup, 'clean_disks')
++    @mock.patch.object(FilesystemSetup, 'clean_disks')
++    def test_clean_disks_on_syssetup_config_nohwraid(self, fs, ls, ps, hp, ms,
++                                                     ss, sys, is_hpraid,
++                                                     is_megacli):
++        cfg_dict = {
++            'disk_config': {
++                'hwraid': {
++                    'raid0': {
++                        'raidtype': 5,
++                        'partitions': ['disk0', 'disk1']
++                    }
++                }
++            }
++        }
++        is_hpraid.return_value = False
++        is_megacli.return_value = False
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++
++        sysinst.clean_disks()
++
++        fs.assert_called_once()
++        ls.assert_called_once()
++        ps.assert_called_once()
++        hp.assert_not_called()
++        ms.assert_not_called()
++        ss.assert_called_once()
++        sys.assert_called_once()
++
++
++class TestSystemInstaller(unittest.TestCase):
++
++    @mock.patch.object(SwRaidSetup, 'setup_disks')
++    def test_make_swraid_with_swriaid(self, sd):
++        cfg_dict = {
++            'disk_config': {
++                'swraid': {
++                    'md0': {
++                        'raidtype': 1,
++                        'partitions': ['d0p0', 'd1p1']
++                    }
++                }
++            }
++        }
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        sysinst.make_swraid(['device'])
++        sd.assert_called_with(['device'])
++
++    @mock.patch.object(SwRaidSetup, 'setup_disks')
++    def test_make_swraid_without_swriaid(self, sd):
++        cfg_dict = {'disk_config': {}}
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        self.assertListEqual(sysinst.make_swraid(['device']), ['device'])
++        sd.assert_not_called()
++
++    @mock.patch.object(PartitionSetup, 'setup_disks')
++    def test_partition_disks(self, ps):
++        cfg_dict = {
++            'disk_config': {
++                'blockdev': {
++                    'disk0': {
++                        'd0p0': {
++                            'candidates': 'any'
++                        }
++                    },
++                    'disk1': {
++                        'd1p0': {
++                            'candidates': 'any'
++                        }
++                    },
++                }
++            }
++        }
++
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        sysinst.partition_disks(['device'])
++        ps.assert_called_once()
++
++    @mock.patch.object(MegaCliSetup, 'is_megacli_controller')
++    @mock.patch.object(MegaCliSetup, 'setup_disks')
++    def test_make_hwraid_with_swraid_megacli(self, sd, megacli):
++        megacli.return_value = True
++        cfg_dict = {
++            'disk_config': {
++                'hwraid': {
++                    'raid0': {
++                        'raidtype': 5,
++                        'partitions': ['disk0', 'disk1']
++                    }
++                }
++            }
++        }
++
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        sysinst.make_hwraid(['device'])
++        sd.assert_called_with(['device'])
++
++    @mock.patch.object(MegaCliSetup, 'is_megacli_controller')
++    @mock.patch.object(HpSsaCliSetup, 'is_hpraid_controller')
++    @mock.patch.object(HpSsaCliSetup, 'setup_disks')
++    def test_make_hwraid_with_swraid_hpraid(self, sd, hpraid, megacli):
++        megacli.return_value = False
++        hpraid.return_value = True
++        cfg_dict = {
++            'disk_config': {
++                'hwraid': {
++                    'raid0': {
++                        'raidtype': 5,
++                        'partitions': ['disk0', 'disk1']
++                    }
++                }
++            }
++        }
++
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        sysinst.make_hwraid(['device'])
++        sd.assert_called_with(['device'])
++
++    @mock.patch.object(MegaCliSetup, 'setup_disks')
++    def test_make_hwraid_without_swriaid(self, ms):
++        cfg_dict = {'disk_config': {}}
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        self.assertListEqual(sysinst.make_hwraid(['device']), ['device'])
++        ms.assert_not_called()
++
++    @mock.patch.object(LvmSetup, 'setup_disks')
++    def test_make_lvs_with_lvm(self, ls):
++        cfg_dict = {
++            'disk_config': {
++                'lvm': {
++                    'sys': {
++                        'LVs': {
++                            'home': {'minsize': '1G'}
++                        },
++                        'PVs': ['d0p2']
++                    }
++                }
++            }
++        }
++
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        sysinst.make_lvm(['device'])
++        ls.assert_called_with(['device'])
++
++    @mock.patch.object(LvmSetup, 'setup_disks')
++    def test_make_lvs_without_lvm(self, ls):
++        cfg_dict = {'disk_config': {}}
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        self.assertListEqual(sysinst.make_lvm(['device']), ['device'])
++        ls.assert_not_called()
++
++    @mock.patch.object(FilesystemSetup, 'setup_disks')
++    def test_format_partitons(self, fs):
++        cfg_dict = {
++            'disk_config': {
++                'blockdev': {
++                    'disk0': {
++                        'd0p0': {
++                            'candidates': 'any'
++                        }
++                    },
++                    'disk1': {
++                        'd1p0': {
++                            'candidates': 'any'
++                        }
++                    },
++                },
++                'filesystems': {
++                    'd1p0': {'mountpoint': '/'}
++                },
++            }
++        }
++
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        sysinst.format_partitions(['device'])
++        fs.assert_called_once()
++
++    @mock.patch.object(SystemSetup, 'setup_disks')
++    def test_install_system(self, ss):
++        cfg_dict = {
++            'disk_config': {
++                'filesystems': {
++                    'd1p0': {'mountpoint': '/'}
++                },
++            }
++        }
++
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        sysinst.install_system(['device'], 'image_path')
++        ss.assert_called_once()
++
++    @mock.patch.object(si.SystemInstaller, 'install_system')
++    @mock.patch.object(si.SystemInstaller, 'format_partitions')
++    @mock.patch.object(si.SystemInstaller, 'make_lvm')
++    @mock.patch.object(si.SystemInstaller, 'make_swraid')
++    @mock.patch.object(si.SystemInstaller, 'partition_disks')
++    @mock.patch.object(si.SystemInstaller, 'make_hwraid')
++    @mock.patch.object(si.SystemInstaller, 'clean_disks')
++    @mock.patch.object(si.SystemInstaller, 'validate_env')
++    @mock.patch.object(si.SystemInstaller, 'validate_conf')
++    def test_install(self, vc, ve, cd, mh, pd, ms, ml, fp, ins):
++        cfg_dict = {'disk_config': {'filesystems': {}}}
++
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        sysinst.install('image_path')
++
++        vc.assert_called_once()
++        ve.assert_called_once()
++        cd.assert_called_once()
++        mh.assert_called_once()
++        pd.assert_called_once()
++        ms.assert_called_once()
++        ml.assert_called_once()
++        fp.assert_called_once()
++        ins.assert_called_once()
++
++    @mock.patch.object(FilesystemSetup, 'get_disks_by_labels')
++    @mock.patch.object(si.SystemInstaller, 'install_system')
++    @mock.patch.object(si.SystemInstaller, 'format_partitions')
++    @mock.patch.object(si.SystemInstaller, 'make_lvm')
++    @mock.patch.object(si.SystemInstaller, 'make_swraid')
++    @mock.patch.object(si.SystemInstaller, 'partition_disks')
++    @mock.patch.object(si.SystemInstaller, 'make_hwraid')
++    @mock.patch.object(si.SystemInstaller, 'clean_disks')
++    @mock.patch.object(si.SystemInstaller, 'validate_env_preserve')
++    @mock.patch.object(si.SystemInstaller, 'validate_conf')
++    def test_install_preserve(self, vc, ve, cd, mh, pd, ms, ml, fp, ins, dl):
++        dl.return_value = {}
++        cfg_dict = {'disk_config': {'filesystems': {'test': {'preserve': 1}}}}
++
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        sysinst.install('image_path')
++
++        vc.assert_called_once()
++        ve.assert_called_once()
++        self.assertFalse(cd.called)
++        self.assertFalse(mh.called)
++        self.assertFalse(pd.called)
++        self.assertFalse(ms.called)
++        self.assertFalse(ml.called)
++        fp.assert_called_once()
++        ins.assert_called_once()
+diff --git a/ironic_lib/tests/test_system_installer_base.py b/ironic_lib/tests/test_system_installer_base.py
+new file mode 100644
+index 0000000..8e1b879
+--- /dev/null
++++ b/ironic_lib/tests/test_system_installer_base.py
+@@ -0,0 +1,48 @@
++# Copyright (c) 2018 Intel Corporation
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++# implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import unittest
++
++from ironic_lib.system_installer import base
++
++
++class TestSystemInstallerValidateConf(unittest.TestCase):
++
++    def test_clean_disks_arguments(self):
++        setup = base.Setup({'': ''})
++        setup.clean_disks({})
++
++    def test_validate_conf(self):
++        setup = base.Setup({'': ''})
++        setup.validate_conf()
++
++    def test_validate_env(self):
++        setup = base.Setup({'': ''})
++        setup.validate_env()
++
++    def test_clean_disks_arguments_negative(self):
++        setup = base.Setup({'': ''})
++        with self.assertRaises(TypeError):
++            setup.clean_disks({}, 'bla')
++
++    def test_validate_conf_negative(self):
++        setup = base.Setup({'': ''})
++        with self.assertRaises(TypeError):
++            setup.validate_conf('bla')
++
++    def test_validate_env_negative(self):
++        setup = base.Setup({'': ''})
++        with self.assertRaises(TypeError):
++            setup.validate_env('bla')
+diff --git a/requirements.txt b/requirements.txt
+index b90d8d4..7f0e350 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -3,6 +3,10 @@
+ # process, which may cause wedges in the gate later.
+ 
+ pbr>=1.8 # Apache-2.0
++backports.functools_lru_cache
++bitmath
++jsonschema
++pyyaml
+ oslo.concurrency>=3.8.0 # Apache-2.0
+ oslo.config!=3.18.0,>=3.14.0 # Apache-2.0
+ oslo.i18n>=2.1.0 # Apache-2.0
+diff --git a/tools/system_installer.py b/tools/system_installer.py
+new file mode 100755
+index 0000000..ca1cbc7
+--- /dev/null
++++ b/tools/system_installer.py
+@@ -0,0 +1,26 @@
++#!/usr/bin/python
++# Copyright (c) 2018 Intel Corporation
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++# implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from sys import argv
++
++from ironic_lib.system_installer import SystemInstaller
++
++
++try:
++    with open(argv[1]) as f:
++        SystemInstaller(f.read()).install(argv[2])
++except IndexError:
++    print("Usage: {} <config.yaml> <image.qcow2>".format(argv[0]))
+diff --git a/tox.ini b/tox.ini
+index 0ce3cdb..038bc1a 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -11,7 +11,9 @@ setenv = VIRTUAL_ENV={envdir}
+          PYTHONDONTWRITEBYTECODE = 1
+          LANGUAGE=en_US
+          TESTS_DIR=./ironic_lib/tests/
+-deps = -r{toxinidir}/test-requirements.txt
++deps =
++    -r{toxinidir}/test-requirements.txt
++    -r{toxinidir}/requirements.txt
+ commands = ostestr {posargs}
+ 
+ [flake8]
+-- 
+2.14.1
+
