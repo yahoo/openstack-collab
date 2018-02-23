@@ -1,7 +1,7 @@
 From 69d0e023edfc2edc123fd5ed29b79ebbd3abe97f Mon Sep 17 00:00:00 2001
 From: Roman Dobosz <roman.dobosz@intel.com>
 Date: Wed, 10 Jan 2018 10:37:54 +0100
-Subject: [PATCH 3/4] get instance group's aggregate associations
+Subject: [PATCH 3/8] get instance group's aggregate associations
 
 Ocata backport for patch from Jay Pipes:
 https://review.openstack.org/#/c/531243/
@@ -34,10 +34,11 @@ index 670813b77e..2be47278b2 100644
  
      fields = {
          'id': fields.IntegerField(),
-@@ -455,6 +457,38 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject,
+@@ -454,6 +456,38 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject,
+         return list(set([instance.host for instance in instances
                           if instance.host]))
  
-     @base.remotable
++    @base.remotable
 +    def get_aggregate_uuids(self, exclude=None):
 +        """Returns a set of aggregate UUIDs associated with all compute nodes
 +        that are housing all non-deleted instances in the group
@@ -69,10 +70,9 @@ index 670813b77e..2be47278b2 100644
 +        agg_uuids = [r[0] for r in res]
 +        return set(agg_uuids)
 +
-+    @base.remotable
+     @base.remotable
      def count_members_by_user(self, user_id):
          """Count the number of instances in a group belonging to a user."""
-         filter_uuids = self.members
 diff --git a/nova/tests/functional/db/test_instance_group.py b/nova/tests/functional/db/test_instance_group.py
 index 4c4f627fe2..b4c7ef3fd8 100644
 --- a/nova/tests/functional/db/test_instance_group.py
@@ -250,5 +250,5 @@ index 71b919597f..a577820d0c 100644
      'InstanceInfoCache': '1.5-cd8b96fefe0fc8d4d337243ba0bf0e1e',
      'InstanceList': '2.2-ff71772c7bf6d72f6ef6eee0199fb1c9',
 -- 
-2.13.6
+2.16.1
 
