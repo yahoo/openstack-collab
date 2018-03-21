@@ -1,7 +1,7 @@
 From 9014195f11d981da4dc158ab9b9b6bb594c8ea0d Mon Sep 17 00:00:00 2001
 From: Roman Dobosz <roman.dobosz@intel.com>
 Date: Fri, 23 Feb 2018 07:26:05 +0100
-Subject: [PATCH 5/8] Added node field for InstanceGroup objects
+Subject: [PATCH 5/9] Added node field for InstanceGroup objects
 
 Currently, there is only a way for getting the information which hosts
 belongs for certain instance group. By 'hosts' it means a hostname, on

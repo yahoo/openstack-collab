@@ -1,7 +1,7 @@
 From 69d0e023edfc2edc123fd5ed29b79ebbd3abe97f Mon Sep 17 00:00:00 2001
 From: Roman Dobosz <roman.dobosz@intel.com>
 Date: Wed, 10 Jan 2018 10:37:54 +0100
-Subject: [PATCH 3/8] get instance group's aggregate associations
+Subject: [PATCH 3/9] get instance group's aggregate associations
 
 Ocata backport for patch from Jay Pipes:
 https://review.openstack.org/#/c/531243/

@@ -1,7 +1,7 @@
 From 3e4ef01cb6f3fa5545cd3be31d84295d65f73fa7 Mon Sep 17 00:00:00 2001
 From: Roman Dobosz <roman.dobosz@intel.com>
 Date: Fri, 23 Feb 2018 09:19:54 +0000
-Subject: [PATCH 6/8] Add ability to search aggregate map via ironic node as a
+Subject: [PATCH 6/9] Add ability to search aggregate map via ironic node as a
  key in HostManager
 
 With this change now it will be possible for mapping nodes with aggregate.

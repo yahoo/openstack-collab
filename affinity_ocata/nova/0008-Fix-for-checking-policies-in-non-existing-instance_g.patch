@@ -1,7 +1,7 @@
 From 72af3e6b58c3a732549b40fbb24067a41c7065ac Mon Sep 17 00:00:00 2001
 From: Roman Dobosz <roman.dobosz@intel.com>
 Date: Fri, 23 Feb 2018 11:37:16 +0000
-Subject: [PATCH 8/8] Fix for checking policies in non existing instance_group
+Subject: [PATCH 8/9] Fix for checking policies in non existing instance_group
 
 ---
  nova/scheduler/filters/affinity_filter.py | 2 +-

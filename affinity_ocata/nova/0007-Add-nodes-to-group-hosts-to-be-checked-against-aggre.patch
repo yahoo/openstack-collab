@@ -1,7 +1,7 @@
 From 6f8af77366402aca0555005abe469b29509d0eb3 Mon Sep 17 00:00:00 2001
 From: Roman Dobosz <roman.dobosz@intel.com>
 Date: Fri, 23 Feb 2018 11:28:52 +0000
-Subject: [PATCH 7/8] Add nodes to group hosts to be checked against
+Subject: [PATCH 7/9] Add nodes to group hosts to be checked against
  aggregation
 
 Currently, only hostnames (which origin from machine, on which compute service

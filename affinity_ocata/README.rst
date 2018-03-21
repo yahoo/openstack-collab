@@ -1,7 +1,7 @@
 Aggregate affinity
 ==================
 
-This series of patches add ability for creating aggregation of ironic nodes in
+This series of patches adds ability for creating aggregation of ironic nodes in
 Nova. This work is based on work of `Jay Pipes series`_ back ported to Ocata,
 with some additional fixes.
 
@@ -15,8 +15,9 @@ of two new policies:
 Note, that if openstackclient is used, it is needed to overwrite
 ``OS_COMPUTE_API_VERSION`` environment variable to value ``2.43``.
 
-Given, that we are working on devstack, and have available four Ironic nodes,
-basic flow to test it is as follows:
+Given, that we are working on devstack, and have available four Ironic nodes
+(it need to be changed in devstacks' ``local.conf`` by setting variable
+``IRONIC_VM_COUNT`` to ``4``), basic flow to test it is as follows:
 
 .. code:: shell-session
 
@@ -41,7 +42,84 @@ basic flow to test it is as follows:
          --hint group=$(openstack server group list | grep group1 | awk '{print $2}') \
          instance2
 
-this should place two ironic instances on two different `rack` aggregates.
+this should place two ironic instances on two different *rack* aggregates. In
+similar fashion it might be group created with policy ``aggregate-affinity``.
+
+
+Soft aggregate affinity
+=======================
+
+This is similar feature to `soft (anti) affinity* feature`_ which was
+done for compute hosts. There are two new weight introduced:
+
+* aggregate-soft-affinity
+* aggregate-soft-anti-affinity
+
+and can be used for scattering instances between two aggregates within
+an instance group with two policies - to keep instances within an
+aggregate (affinity), or to spread them around on different aggregates.
+If there would be not possible to put an instance together on an
+aggregate (in case of affinity) or on different one (in case of
+anti-affinity), it will be placed in specified group anyway.
+
+Simple usage is as follows, using environment described above in
+*aggregate-affinity* feature:
+
+.. code:: shell-session
+
+   $ export OS_COMPUTE_API_VERSION=2.43
+   $ openstack aggregate create rack1
+   $ openstack aggregate create rack2
+   $ openstack aggregate add host rack1 $(openstack baremetal node list|grep node-0|awk '{print $2}')
+   $ openstack aggregate add host rack1 $(openstack baremetal node list|grep node-1|awk '{print $2}')
+   $ openstack aggregate add host rack2 $(openstack baremetal node list|grep node-2|awk '{print $2}')
+   $ openstack aggregate add host rack2 $(openstack baremetal node list|grep node-3|awk '{print $2}')
+   $ openstack server group create --policy aggregate-soft-anti-affinity group1
+   $ openstack server create \
+         --image=$(openstack image list|grep x86_64-disk| awk '{print $2}') \
+         --flavor=1 \
+         --nic net-id=$(openstack network list |grep private | awk '{print $2}') \
+         --hint group=$(openstack server group list | grep group1 | awk '{print $2}') \
+         instance1
+   $ openstack server create \
+         --image=$(openstack image list|grep x86_64-disk| awk '{print $2}') \
+         --flavor=1 \
+         --nic net-id=$(openstack network list |grep private | awk '{print $2}') \
+         --hint group=$(openstack server group list | grep group1 | awk '{print $2}') \
+         instance2
+   $ openstack server create \
+         --image=$(openstack image list|grep x86_64-disk| awk '{print $2}') \
+         --flavor=1 \
+         --nic net-id=$(openstack network list |grep private | awk '{print $2}') \
+         --hint group=$(openstack server group list | grep group1 | awk '{print $2}') \
+         instance3
+
+Unlike in ``aggregate-anti-affinity`` policy, creating ``instance3`` will
+pass, since regardless of not available aggregate with no group members, it
+will be placed in the group anyway on one of the available host within the
+group.
+
+
+Configuration
+-------------
+
+As for soft aggregate (anti) affinity there is another limitation, which comes
+with how weights works right now in Nova. Because of `this commit`_ change of
+behaviour was introduced on how scheduler selects hosts. It's concerns all of
+affinity/anti-affinity weights, not only this particular newly added for
+aggregation.
+
+That change introduce a blind selection of the host form a group of the weighed
+hosts, which are originally sorted from best fitting. For affinity weight it
+will always return full list of the hosts (since they are not a filters), which
+is ordered from best to worst hosts. There is a high chance, that ``nova.conf``
+will need to have a scheduler filter option ``host_subset_size`` set to ``1``,
+like:
+
+.. code:: ini
+
+   [filter_scheduler]
+   host_subset_size = 1
 
 
 Creation of instances in a bulk
@@ -226,3 +304,5 @@ instances one by one, but not in the bulk.
 
 
 .. _Jay Pipes series: https://review.openstack.org/#/q/topic:bp/aggregate-affinity
+.. _this commit: https://review.openstack.org/#/c/19823/
+.. _soft (anti) affinity* feature: http://specs.openstack.org/openstack/nova-specs/specs/kilo/approved/soft-affinity-for-server-group.html

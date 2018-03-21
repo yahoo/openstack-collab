@@ -1,7 +1,7 @@
 From f5e23e436d341a44dafe5a18876cfcadc809b46b Mon Sep 17 00:00:00 2001
 From: Roman Dobosz <roman.dobosz@intel.com>
 Date: Mon, 8 Jan 2018 14:33:45 +0100
-Subject: [PATCH 2/8] Remove server group sched filter support caching
+Subject: [PATCH 2/9] Remove server group sched filter support caching
 
 Backport of https://review.openstack.org/#/c/529200 by Jay Pipes to
 Ocata.

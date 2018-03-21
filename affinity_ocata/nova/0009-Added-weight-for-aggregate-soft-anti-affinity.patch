@@ -1,0 +1,313 @@
+From 85c5a788ebe71089d06bc82a57a5a4b10dd72fe8 Mon Sep 17 00:00:00 2001
+From: Roman Dobosz <roman.dobosz@intel.com>
+Date: Wed, 14 Mar 2018 14:01:55 +0100
+Subject: [PATCH 9/9] Added weight for aggregate soft (anti) affinity.
+
+This is similar feature to soft (anti) affinity feature[1] which was
+done for compute hosts. In This commit we introducing two new weights:
+
+- aggregate-soft-affinity
+- aggregate-soft-anti-affinity
+
+which can be used for scattering instances between two aggregates within
+an instance group with two policies - to keep instances within an
+aggregate (affinity), or to spread them around on different aggregates.
+If there would be not possible to put an instance together on an
+aggregate (in case of affinity) or on different one (in case of
+anti-affinity), it will be placed in specified group anyway.
+
+[1] http://specs.openstack.org/openstack/nova-specs/specs/kilo/approved/soft-affinity-for-server-group.html
+---
+ .../api/openstack/compute/schemas/server_groups.py |   4 +-
+ nova/compute/manager.py                            |   2 +-
+ nova/conf/scheduler.py                             |  24 ++++
+ nova/scheduler/utils.py                            |   6 +-
+ nova/scheduler/weights/affinity.py                 |  66 +++++++++++
+ .../scheduler/weights/test_weights_affinity.py     | 123 +++++++++++++++++++++
+ 6 files changed, 222 insertions(+), 3 deletions(-)
+
+diff --git a/nova/api/openstack/compute/schemas/server_groups.py b/nova/api/openstack/compute/schemas/server_groups.py
+index 4b274e3251..408a559d99 100644
+--- a/nova/api/openstack/compute/schemas/server_groups.py
++++ b/nova/api/openstack/compute/schemas/server_groups.py
+@@ -47,4 +47,6 @@ policies['items'][0]['enum'].extend(['soft-anti-affinity', 'soft-affinity'])
+ create_v243 = copy.deepcopy(create_v215)
+ policies = create_v243['properties']['server_group']['properties']['policies']
+ policies['items'][0]['enum'].extend(['aggregate-anti-affinity',
+-                                     'aggregate-affinity'])
++                                     'aggregate-affinity',
++                                     'aggregate-soft-anti-affinity',
++                                     'aggregate-soft-affinity'])
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 10ed9d3df0..8040d2fa7c 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -1328,7 +1328,7 @@ class ComputeManager(manager.Manager):
+                         raise exception.RescheduledException(
+                                 instance_uuid=instance.uuid,
+                                 reason=msg)
+-                else:
++                elif 'aggregate-anti-affinity' == group_policy:
+                     group_aggs = group.get_aggregate_uuids(
+                         exclude=[instance.uuid])
+                     if not node_aggs.isdisjoint(group_aggs):
+diff --git a/nova/conf/scheduler.py b/nova/conf/scheduler.py
+index 6b69f9d1a2..710eebcad6 100644
+--- a/nova/conf/scheduler.py
++++ b/nova/conf/scheduler.py
+@@ -462,6 +462,30 @@ Multiplier used for weighing hosts for group soft-anti-affinity.
+ 
+ Possible values:
+ 
++* An integer or float value, where the value corresponds to weight multiplier
++  for hosts with group soft anti-affinity. Only a positive value are
++  meaningful, as negative values would make this behave as a soft affinity
++  weigher.
++"""),
++    cfg.FloatOpt("aggregate_soft_affinity_weight_multiplier",
++        default=1.0,
++        help="""
++Multiplier used for weighing hosts for group soft-affinity.
++
++Possible values:
++
++* An integer or float value, where the value corresponds to weight multiplier
++  for hosts with group soft affinity. Only a positive value are meaningful, as
++  negative values would make this behave as a soft anti-affinity weigher.
++"""),
++    cfg.FloatOpt(
++        "aggregate_soft_anti_affinity_weight_multiplier",
++        default=1.0,
++        help="""
++Multiplier used for weighing hosts for group soft-anti-affinity.
++
++Possible values:
++
+ * An integer or float value, where the value corresponds to weight multiplier
+   for hosts with group soft anti-affinity. Only a positive value are
+   meaningful, as negative values would make this behave as a soft affinity
+diff --git a/nova/scheduler/utils.py b/nova/scheduler/utils.py
+index 57a306e07a..57f8cf343f 100644
+--- a/nova/scheduler/utils.py
++++ b/nova/scheduler/utils.py
+@@ -311,7 +311,11 @@ def _get_group_details(context, instance_uuid, user_group_hosts=None):
+         'aggregate-affinity': (
+             _validate_filter, 'ServerGroupAggregateAffinityFilter'),
+         'aggregate-anti-affinity': (
+-            _validate_filter, 'ServerGroupAggregateAntiAffinityFilter')
++            _validate_filter, 'ServerGroupAggregateAntiAffinityFilter'),
++        'aggregate-soft-affinity': (
++            _validate_weigher, 'ServerGroupAggregateSoftAffinityWeigher'),
++        'aggregate-soft-anti-affinity': (
++            _validate_weigher, 'ServerGroupAggregateSoftAntiAffinityWeigher')
+     }
+ 
+     check_fn, class_name = checks[group_policy]
+diff --git a/nova/scheduler/weights/affinity.py b/nova/scheduler/weights/affinity.py
+index 1a9a277b86..9f98c9a510 100644
+--- a/nova/scheduler/weights/affinity.py
++++ b/nova/scheduler/weights/affinity.py
+@@ -95,3 +95,69 @@ class ServerGroupSoftAntiAffinityWeigher(_SoftAffinityWeigherBase):
+         weight = super(ServerGroupSoftAntiAffinityWeigher, self)._weigh_object(
+             host_state, request_spec)
+         return -1 * weight
++
++
++class ServerGroupAggregateSoftAffinityWeigher(weights.BaseHostWeigher):
++    """ServerGroupAggregateSoftAffinityWeigher implements the soft-affinity
++    policy for server groups by preferring the aggregates that has more
++    instances from the given group.
++    """
++
++    POLICY_NAME = 'aggregate-soft-affinity'
++    CONF = CONF.filter_scheduler.aggregate_soft_affinity_weight_multiplier
++
++    def _pre_checks(self, host_state, request_spec):
++        if not (request_spec.instance_group and
++                request_spec.instance_group.policies):
++            return 0
++
++        policy = request_spec.instance_group.policies[0]
++        if self.POLICY_NAME != policy:
++            return 0
++
++        self.group_hosts = set(request_spec.instance_group.nodes +
++                               request_spec.instance_group.hosts)
++
++        if not self.group_hosts:
++            # There are no members of the server group yet, so this host meets
++            # the aggregate affinity (or anti-affinity) constraint
++            return 0
++
++        return 1
++
++    def _weigh_object(self, host_state, request_spec):
++        """Higher weights win."""
++        if not self._pre_checks(host_state, request_spec):
++            return 0
++
++        weight = []
++        for aggregate in host_state.aggregates:
++            aggregate_weight = 0
++            for hostname in aggregate.hosts:
++                if hostname in self.group_hosts:
++                    aggregate_weight += 1
++            weight.append(aggregate_weight)
++
++        if not weight:
++            return 0
++
++        return float(sum(weight)) / len(weight)
++
++    def weight_multiplier(self):
++        """How weighted this weigher should be."""
++        return self.CONF
++
++
++class ServerGroupAggregateSoftAntiAffinityWeigher(
++        ServerGroupAggregateSoftAffinityWeigher):
++    """ServerGroupAggregateSoftAntiAffinityWeigher implements the
++    soft-affinity policy for server groups by preferring the aggregates that
++    has less instances from the given group.
++    """
++
++    POLICY_NAME = 'aggregate-soft-anti-affinity'
++    CONF = CONF.filter_scheduler.aggregate_soft_anti_affinity_weight_multiplier
++
++    def _weigh_object(self, host_state, request_spec):
++        return -1 * super(ServerGroupAggregateSoftAntiAffinityWeigher,
++                          self)._weigh_object(host_state, request_spec)
+diff --git a/nova/tests/unit/scheduler/weights/test_weights_affinity.py b/nova/tests/unit/scheduler/weights/test_weights_affinity.py
+index 21dbc19c9f..f5b898228a 100644
+--- a/nova/tests/unit/scheduler/weights/test_weights_affinity.py
++++ b/nova/tests/unit/scheduler/weights/test_weights_affinity.py
+@@ -157,3 +157,126 @@ class SoftAntiAffinityWeigherTestCase(SoftWeigherTestBase):
+                       expected_weight=0.0,
+                       expected_host='host2')
+         self.assertEqual(1, mock_log.warning.call_count)
++
++
++class _FakeAggregate(object):
++    def __init__(self, hosts):
++        self.hosts = hosts
++
++
++class AggregateSoftWeigherTestBase(test.NoDBTestCase):
++
++    def setUp(self):
++        super(AggregateSoftWeigherTestBase, self).setUp()
++        hosts = (('host1', 'iron1',
++                  {'aggregates': [_FakeAggregate(['iron1',
++                                                  'iron2'])],
++                   'instances': {'i1': mock.sentinel,
++                                 'i2': mock.sentinel}}),
++                 ('host1', 'iron2',
++                  {'aggregates': [_FakeAggregate(['iron1',
++                                                  'iron2'])],
++                   'instances': {'i3': mock.sentinel}}),
++                 ('host1', 'iron3',
++                  {'aggregates': [_FakeAggregate(['iron3',
++                                                  'iron4'])],
++                   'instances': {'i3': mock.sentinel}}),
++                 ('host1', 'iron4',
++                  {'aggregates': [_FakeAggregate(['iron3',
++                                                  'iron4'])],
++                   'instances': {'i3': mock.sentinel}}))
++
++        self.hs_list = []
++        for host in hosts:
++            self.hs_list.append(fakes.FakeHostState(*host))
++
++
++class TestAggregateSoftAntiAffinityWeigher(AggregateSoftWeigherTestBase):
++
++    def setUp(self):
++        super(TestAggregateSoftAntiAffinityWeigher, self).setUp()
++        self.weighers = [affinity.
++                         ServerGroupAggregateSoftAntiAffinityWeigher()]
++        self.weight_handler = weights.HostWeightHandler()
++
++    def test_no_instances(self):
++
++        ig = objects.InstanceGroup(policies=['aggregate-soft-anti-affinity'],
++                                   hosts=[],
++                                   nodes=[])
++
++        req_spec = objects.RequestSpec(instance_group=ig)
++
++        res = self.weight_handler.get_weighed_objects(self.weighers,
++                                                      self.hs_list, req_spec)
++        self.assertIn(res[0].obj.nodename,
++                      ('iron1', 'iron2', 'iron3', 'iron4'))
++
++    def test_instance_in_first_aggregate(self):
++
++        ig = objects.InstanceGroup(policies=['aggregate-soft-anti-affinity'],
++                                   hosts=['host1'],
++                                   nodes=['iron1'])
++
++        req_spec = objects.RequestSpec(instance_group=ig)
++
++        res = self.weight_handler.get_weighed_objects(self.weighers,
++                                                      self.hs_list, req_spec)
++        self.assertIn(res[0].obj.nodename, ('iron3', 'iron4'))
++
++    def test_two_instances_in_first_aggregate(self):
++
++        ig = objects.InstanceGroup(policies=['aggregate-soft-anti-affinity'],
++                                   hosts=['host1'],
++                                   nodes=['iron1', 'iron2'])
++
++        req_spec = objects.RequestSpec(instance_group=ig)
++
++        res = self.weight_handler.get_weighed_objects(self.weighers,
++                                                      self.hs_list, req_spec)
++        self.assertIn(res[0].obj.nodename, ('iron3', 'iron4'))
++
++
++class TestAggregateSoftAffinityWeigher(AggregateSoftWeigherTestBase):
++
++    def setUp(self):
++        super(TestAggregateSoftAffinityWeigher, self).setUp()
++        self.weight_handler = weights.HostWeightHandler()
++        self.weighers = [affinity.ServerGroupAggregateSoftAffinityWeigher()]
++
++    def test_no_instances(self):
++
++        ig = objects.InstanceGroup(policies=['aggregate-soft-anti-affinity'],
++                                   hosts=[],
++                                   nodes=[])
++
++        req_spec = objects.RequestSpec(instance_group=ig)
++
++        res = self.weight_handler.get_weighed_objects(self.weighers,
++                                                      self.hs_list, req_spec)
++        self.assertIn(res[0].obj.nodename,
++                      ('iron1', 'iron2', 'iron3', 'iron4'))
++
++    def test_instance_in_first_aggregate(self):
++
++        ig = objects.InstanceGroup(policies=['aggregate-soft-anti-affinity'],
++                                   hosts=['host1'],
++                                   nodes=['iron1'])
++
++        req_spec = objects.RequestSpec(instance_group=ig)
++
++        res = self.weight_handler.get_weighed_objects(self.weighers,
++                                                      self.hs_list, req_spec)
++        self.assertIn(res[0].obj.nodename, ('iron1', 'iron2'))
++
++    def test_two_instances_in_first_aggregate(self):
++
++        ig = objects.InstanceGroup(policies=['aggregate-soft-anti-affinity'],
++                                   hosts=['host1'],
++                                   nodes=['iron1', 'iron2'])
++
++        req_spec = objects.RequestSpec(instance_group=ig)
++
++        res = self.weight_handler.get_weighed_objects(self.weighers,
++                                                      self.hs_list, req_spec)
++        self.assertIn(res[0].obj.nodename, ('iron1', 'iron2'))
+-- 
+2.16.1
+

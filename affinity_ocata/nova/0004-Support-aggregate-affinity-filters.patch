@@ -1,7 +1,7 @@
 From f69827ff3502552a45a19a50ef2cfad30c41af2d Mon Sep 17 00:00:00 2001
 From: Roman Dobosz <roman.dobosz@intel.com>
 Date: Thu, 18 Jan 2018 09:17:04 +0100
-Subject: [PATCH 4/8] Support aggregate affinity filters
+Subject: [PATCH 4/9] Support aggregate affinity filters
 
 Jay patch for two new policies: aggregate-affinity and
 aggregate-antiaffinity backported to Ocata.
