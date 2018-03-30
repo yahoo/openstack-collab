@@ -1,0 +1,469 @@
+From f69827ff3502552a45a19a50ef2cfad30c41af2d Mon Sep 17 00:00:00 2001
+From: Roman Dobosz <roman.dobosz@intel.com>
+Date: Thu, 18 Jan 2018 09:17:04 +0100
+Subject: [PATCH 4/9] Support aggregate affinity filters
+
+Jay patch for two new policies: aggregate-affinity and
+aggregate-antiaffinity backported to Ocata.
+
+https://review.openstack.org/#/c/529201/
+---
+ doc/api_samples/versions/v21-version-get-resp.json |   2 +-
+ doc/api_samples/versions/versions-get-resp.json    |   2 +-
+ nova/api/openstack/api_version_request.py          |   4 +-
+ .../openstack/compute/rest_api_version_history.rst |  12 ++
+ .../api/openstack/compute/schemas/server_groups.py |   5 +
+ nova/api/openstack/compute/server_groups.py        |   3 +-
+ nova/compute/manager.py                            |  33 ++++-
+ nova/scheduler/filters/affinity_filter.py          |  71 +++++++++++
+ nova/scheduler/host_manager.py                     |   7 ++
+ nova/scheduler/utils.py                            |  21 ++--
+ nova/tests/functional/test_server_group.py         | 140 ++++++++++++++++++++-
+ 11 files changed, 285 insertions(+), 15 deletions(-)
+
+diff --git a/doc/api_samples/versions/v21-version-get-resp.json b/doc/api_samples/versions/v21-version-get-resp.json
+index 64120de26c..241212017e 100644
+--- a/doc/api_samples/versions/v21-version-get-resp.json
++++ b/doc/api_samples/versions/v21-version-get-resp.json
+@@ -19,7 +19,7 @@
+             }
+         ],
+         "status": "CURRENT",
+-        "version": "2.42",
++        "version": "2.43",
+         "min_version": "2.1",
+         "updated": "2013-07-23T11:33:21Z"
+     }
+diff --git a/doc/api_samples/versions/versions-get-resp.json b/doc/api_samples/versions/versions-get-resp.json
+index 27ad9b3703..924b060df1 100644
+--- a/doc/api_samples/versions/versions-get-resp.json
++++ b/doc/api_samples/versions/versions-get-resp.json
+@@ -22,7 +22,7 @@
+                 }
+             ],
+             "status": "CURRENT",
+-            "version": "2.42",
++            "version": "2.43",
+             "min_version": "2.1",
+             "updated": "2013-07-23T11:33:21Z"
+         }
+diff --git a/nova/api/openstack/api_version_request.py b/nova/api/openstack/api_version_request.py
+index dde18537e4..9957afd0af 100644
+--- a/nova/api/openstack/api_version_request.py
++++ b/nova/api/openstack/api_version_request.py
+@@ -102,6 +102,8 @@ REST_API_VERSION_HISTORY = """REST API Version History:
+              re-introduce the tag attribute that, due to bugs, was lost
+              starting with version 2.33 for block devices and starting with
+              version 2.37 for network interfaces.
++    * 2.43 - Add 'aggregate-affinity' and 'aggregate-anti-affinity' server
++             group policies
+ """
+ 
+ # The minimum and maximum versions of the API supported
+@@ -110,7 +112,7 @@ REST_API_VERSION_HISTORY = """REST API Version History:
+ # Note(cyeoh): This only applies for the v2.1 API once microversions
+ # support is fully merged. It does not affect the V2 API.
+ _MIN_API_VERSION = "2.1"
+-_MAX_API_VERSION = "2.42"
++_MAX_API_VERSION = "2.43"
+ DEFAULT_API_VERSION = _MIN_API_VERSION
+ 
+ # Almost all proxy APIs which related to network, images and baremetal
+diff --git a/nova/api/openstack/compute/rest_api_version_history.rst b/nova/api/openstack/compute/rest_api_version_history.rst
+index fee83ead14..deccddfebf 100644
+--- a/nova/api/openstack/compute/rest_api_version_history.rst
++++ b/nova/api/openstack/compute/rest_api_version_history.rst
+@@ -483,3 +483,15 @@ user documentation.
+   2.37 and for block_device_mapping_v2 starting with version 2.33. Microversion
+   2.42 restores the tag parameter to both networks and block_device_mapping_v2,
+   allowing networks and block devices to be tagged again.
++
++2.43
++----
++
++From this version of the API users can choose `aggregate-affinity` and
++`aggregate-anti-affinity` rules for server-groups. The `aggregate-affinity`
++policy for a server group indicates that new members of the server group should
++be placed on hosts that are in the same aggregate(s) associated with hosts
++where other members of the server group are placed. The
++`aggregate-anti-affinity` policy enforces the opposite: ensure that instances
++launched in a server group land on hosts that are *not* associated with
++aggregates that other members of the server group are associated to.
+diff --git a/nova/api/openstack/compute/schemas/server_groups.py b/nova/api/openstack/compute/schemas/server_groups.py
+index 52a08413aa..4b274e3251 100644
+--- a/nova/api/openstack/compute/schemas/server_groups.py
++++ b/nova/api/openstack/compute/schemas/server_groups.py
+@@ -43,3 +43,8 @@ create = {
+ create_v215 = copy.deepcopy(create)
+ policies = create_v215['properties']['server_group']['properties']['policies']
+ policies['items'][0]['enum'].extend(['soft-anti-affinity', 'soft-affinity'])
++
++create_v243 = copy.deepcopy(create_v215)
++policies = create_v243['properties']['server_group']['properties']['policies']
++policies['items'][0]['enum'].extend(['aggregate-anti-affinity',
++                                     'aggregate-affinity'])
+diff --git a/nova/api/openstack/compute/server_groups.py b/nova/api/openstack/compute/server_groups.py
+index dfd2380ec2..82429af5a6 100644
+--- a/nova/api/openstack/compute/server_groups.py
++++ b/nova/api/openstack/compute/server_groups.py
+@@ -132,7 +132,8 @@ class ServerGroupController(wsgi.Controller):
+     @wsgi.Controller.api_version("2.1")
+     @extensions.expected_errors((400, 403))
+     @validation.schema(schema.create, "2.0", "2.14")
+-    @validation.schema(schema.create_v215, "2.15")
++    @validation.schema(schema.create_v215, "2.15", "2.42")
++    @validation.schema(schema.create_v243, "2.43")
+     def create(self, req, body):
+         """Creates a new server group."""
+         context = _authorize_context(req, 'create')
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 86c39c190a..10ed9d3df0 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -1294,7 +1294,9 @@ class ComputeManager(manager.Manager):
+         @utils.synchronized(group_hint)
+         def _do_validation(context, instance, group_hint):
+             group = objects.InstanceGroup.get_by_hint(context, group_hint)
+-            if 'anti-affinity' in group.policies:
++            # NOTE(jaypipes): A server group only has 1 policy...
++            group_policy = group.policies[0]
++            if 'anti-affinity' == group_policy:
+                 group_hosts = group.get_hosts(exclude=[instance.uuid])
+                 if self.host in group_hosts:
+                     msg = _("Anti-affinity instance group policy "
+@@ -1302,14 +1304,39 @@ class ComputeManager(manager.Manager):
+                     raise exception.RescheduledException(
+                             instance_uuid=instance.uuid,
+                             reason=msg)
+-            elif 'affinity' in group.policies:
++            elif 'affinity' == group_policy:
+                 group_hosts = group.get_hosts(exclude=[instance.uuid])
+                 if group_hosts and self.host not in group_hosts:
+                     msg = _("Affinity instance group policy was violated.")
+                     raise exception.RescheduledException(
+                             instance_uuid=instance.uuid,
+                             reason=msg)
+-
++            elif 'aggregate' in group_policy:
++                # NOTE(jaypipes): We look up aggregates by the **node** here,
++                # not the instance.host. This is because the compute node (not
++                # the service record) is expected to be associated with
++                # aggregates when the aggregate affinity filters are being
++                # used.
++                node_aggs = objects.AggregateList.get_by_host(
++                    context, instance.node)
++                node_aggs = set(agg.uuid for agg in node_aggs)
++                if 'aggregate-affinity' == group_policy:
++                    group_aggs = group.get_aggregate_uuids()
++                    if not node_aggs.issubset(group_aggs):
++                        msg = _("Aggregate affinity server group policy was "
++                                "violated.")
++                        raise exception.RescheduledException(
++                                instance_uuid=instance.uuid,
++                                reason=msg)
++                else:
++                    group_aggs = group.get_aggregate_uuids(
++                        exclude=[instance.uuid])
++                    if not node_aggs.isdisjoint(group_aggs):
++                        msg = _("Aggregate anti-affinity server group policy "
++                                "was violated.")
++                        raise exception.RescheduledException(
++                                instance_uuid=instance.uuid,
++                                reason=msg)
+         _do_validation(context, instance, group_hint)
+ 
+     def _log_original_error(self, exc_info, instance_uuid):
+diff --git a/nova/scheduler/filters/affinity_filter.py b/nova/scheduler/filters/affinity_filter.py
+index f8aa47ee03..f025df45df 100644
+--- a/nova/scheduler/filters/affinity_filter.py
++++ b/nova/scheduler/filters/affinity_filter.py
+@@ -145,3 +145,74 @@ class ServerGroupAffinityFilter(_GroupAffinityFilter):
+     def __init__(self):
+         self.policy_name = 'affinity'
+         super(ServerGroupAffinityFilter, self).__init__()
++
++
++class ServerGroupAggregateAffinityFilter(filters.BaseHostFilter):
++    """Filter out any host that isn't in the same host aggregates as the
++    aggregates associated with the host from another member of the server
++    group.
++    """
++
++    RUN_ON_REBUILD = False
++    POLICY_NAME = 'aggregate-affinity'
++    REVERSE_CHECK = False
++
++    def host_passes(self, host_state, spec_obj):
++        if not spec_obj.instance_group.policies:
++            return True
++        policy = spec_obj.instance_group.policies[0]
++        if self.POLICY_NAME != policy:
++            return True
++
++        host_aggs = set(agg.id for agg in host_state.aggregates)
++
++        if not host_aggs:
++            if not self.REVERSE_CHECK:
++                # Clearly, if the host doesn't belong to any aggregates, then
++                # it cannot satisfy an aggregate affinity constraint
++                return False
++            else:
++                # And clearly, if the host doesn't belong to any aggregates,
++                # then it must always satisfy an aggregate anti-affinity
++                # constraint
++                return True
++
++        group_hosts = (spec_obj.instance_group.hosts
++                       if spec_obj.instance_group else [])
++        if not group_hosts:
++            # There are no members of the server group yet, so this host meets
++            # the aggregate affinity (or anti-affinity) constraint
++            return True
++
++        # TODO(jaypipes): The sets used here contain the autoincremented
++        # integer keys for aggregates. :( This means this isn't multi-cell
++        # safe. We would need to modify the host_aggregate_map and associated
++        # HostState.aggregates sets to contain UUIDs instead of IDs to make
++        # this multi-cell safe
++
++        # Grab all aggregates for all hosts in the server group and ensure we
++        # have an intersection with this host's aggregates
++        group_aggs = set()
++        for group_host in group_hosts:
++            group_aggs |= self.host_manager.host_aggregates_map[group_host]
++
++        LOG.debug("%(policy_name)s: check if %(host_aggs)s "
++                  "is %(policy_cond)s subset of %(group_aggs)s",
++                  {
++                      'policy_name': self.POLICY_NAME,
++                      'policy_cond': 'not a' if self.REVERSE_CHECK else 'a',
++                      'group_aggs': group_aggs,
++                      'host_aggs': host_aggs})
++        if self.REVERSE_CHECK:
++            return host_aggs.isdisjoint(group_aggs)
++        return host_aggs.issubset(group_aggs)
++
++
++class ServerGroupAggregateAntiAffinityFilter(
++    ServerGroupAggregateAffinityFilter):
++    """Filter out any host that is in the same host aggregates as the
++    aggregates associated with any host from another member of the server
++    group.
++    """
++    POLICY_NAME = 'aggregate-anti-affinity'
++    REVERSE_CHECK = True
+diff --git a/nova/scheduler/host_manager.py b/nova/scheduler/host_manager.py
+index 4f66d40913..7347722a94 100644
+--- a/nova/scheduler/host_manager.py
++++ b/nova/scheduler/host_manager.py
+@@ -341,6 +341,13 @@ class HostManager(object):
+         self.filter_cls_map = {cls.__name__: cls for cls in filter_classes}
+         self.filter_obj_map = {}
+         self.enabled_filters = self._choose_host_filters(self._load_filters())
++        # NOTE(jaypipes): This is a total hack because the design of the
++        # scheduler and scheduler filters is teh suck. Basically, we are just
++        # jamming a pointer to the host manager into each filter object so that
++        # the filter objects can have access to things like the host manager's
++        # cached aggregate map. Ugly, but it works...
++        for f in self.enabled_filters:
++            f.host_manager = self
+         self.weight_handler = weights.HostWeightHandler()
+         weigher_classes = self.weight_handler.get_matching_classes(
+                 CONF.filter_scheduler.weight_classes)
+diff --git a/nova/scheduler/utils.py b/nova/scheduler/utils.py
+index 682b4cc199..57a306e07a 100644
+--- a/nova/scheduler/utils.py
++++ b/nova/scheduler/utils.py
+@@ -299,13 +299,20 @@ def _get_group_details(context, instance_uuid, user_group_hosts=None):
+ 
+     # NOTE(jaypipes): There's only a single policy for the server group
+     group_policy = group.policies[0]
+-    checks = {'affinity': (_validate_filter, 'ServerGroupAffinityFilter'),
+-              'anti-affinity': (_validate_filter,
+-                                'ServerGroupAntiAffinityFilter'),
+-              'soft-affinity': (_validate_weigher,
+-                                'ServerGroupSoftAffinityWeigher'),
+-              'soft-anti-affinity': (_validate_weigher,
+-                                     'ServerGroupSoftAntiAffinityWeigher')}
++    checks = {
++        'affinity': (
++            _validate_filter, 'ServerGroupAffinityFilter'),
++        'anti-affinity': (
++            _validate_filter, 'ServerGroupAntiAffinityFilter'),
++        'soft-affinity': (
++            _validate_weigher, 'ServerGroupSoftAffinityWeigher'),
++        'soft-anti-affinity': (
++            _validate_weigher, 'ServerGroupSoftAntiAffinityWeigher'),
++        'aggregate-affinity': (
++            _validate_filter, 'ServerGroupAggregateAffinityFilter'),
++        'aggregate-anti-affinity': (
++            _validate_filter, 'ServerGroupAggregateAntiAffinityFilter')
++    }
+ 
+     check_fn, class_name = checks[group_policy]
+     if not check_fn(class_name):
+diff --git a/nova/tests/functional/test_server_group.py b/nova/tests/functional/test_server_group.py
+index 5e52088c14..52af7688bb 100644
+--- a/nova/tests/functional/test_server_group.py
++++ b/nova/tests/functional/test_server_group.py
+@@ -17,6 +17,7 @@ import time
+ 
+ from oslo_config import cfg
+ 
++from nova.compute import api as compute_api
+ from nova import context
+ from nova import db
+ from nova.db.sqlalchemy import api as db_api
+@@ -46,7 +47,9 @@ class ServerGroupTestBase(test.TestCase,
+ 
+     _enabled_filters = (CONF.filter_scheduler.enabled_filters
+                         + ['ServerGroupAntiAffinityFilter',
+-                           'ServerGroupAffinityFilter'])
++                           'ServerGroupAffinityFilter',
++                           'ServerGroupAggregateAntiAffinityFilter',
++                           'ServerGroupAggregateAffinityFilter'])
+ 
+     # Override servicegroup parameters to make the tests run faster
+     _service_down_time = 10
+@@ -812,3 +815,138 @@ class ServerGroupTestV215(ServerGroupTestV21):
+ 
+     def test_soft_affinity_not_supported(self):
+         pass
++
++
++class ServerGroupAggregateAffinityConfTest(ServerGroupTestBase):
++    api_major_version = 'v2.1'
++    group = {
++        'name': 'fake-rack-affinity',
++        'policies': ['aggregate-affinity'],
++    }
++
++    # Load only anti-affinity filter so affinity will be missing
++    _enabled_filters = ['ServerGroupAggregateAntiAffinityFilter']
++
++    def test_aggregate_affinity_no_filter(self):
++        # We need to do this because _boot_a_server_to_group() ends up calling
++        # the images API, and if we set the test case class's microversion
++        # attribute to 2.43, then we will blow up the call to images API (which
++        # was removed in 2.35). yay.
++        self.api.microversion = '2.43'
++        created_group = self.api.post_server_groups(self.group)
++        self.api.microversion = None
++
++        failed_server = self._boot_a_server_to_group(created_group,
++                                                     expected_status='ERROR')
++        self.assertEqual(
++            'ServerGroup policy is not supported: '
++            'ServerGroupAggregateAffinityFilter not configured',
++            failed_server['fault']['message'])
++        self.assertEqual(400, failed_server['fault']['code'])
++
++
++class ServerGroupAggregateAntiAffinityConfTest(ServerGroupTestBase):
++    api_major_version = 'v2.1'
++    group = {
++        'name': 'fake-rack-anti-affinity',
++        'policies': ['aggregate-anti-affinity'],
++    }
++
++    # Load only affinity filter so anti-affinity will be missing
++    _enabled_filters = ['ServerGroupAggregateAffinityFilter']
++
++    def test_aggregate_anti_affinity_no_filter(self):
++        # We need to do this because _boot_a_server_to_group() ends up calling
++        # the images API, and if we set the test case class's microversion
++        # attribute to 2.43, then we will blow up the call to images API (which
++        # was removed in 2.35). yay.
++        self.api.microversion = '2.43'
++        created_group = self.api.post_server_groups(self.group)
++        self.api.microversion = None
++
++        failed_server = self._boot_a_server_to_group(created_group,
++                                                     expected_status='ERROR')
++        self.assertEqual(
++            'ServerGroup policy is not supported: '
++            'ServerGroupAggregateAntiAffinityFilter not configured',
++            failed_server['fault']['message'])
++        self.assertEqual(400, failed_server['fault']['code'])
++
++
++def _host_from_instance(instance):
++    return instance['OS-EXT-SRV-ATTR:host']
++
++
++class AggregateAffinityTest(ServerGroupTestBase):
++
++    def setUp(self):
++        super(AggregateAffinityTest, self).setUp()
++
++        self.stub_out('nova.virt.driver.load_compute_driver',
++                      _fake_load_compute_driver)
++
++        # Start up two compute nodes, associating each with a different host
++        # aggregate
++        self.agg_api = compute_api.AggregateAPI()
++        fake.set_nodes(['node1'])
++        self.compute1 = self.start_service('compute', host='node1')
++        fake.set_nodes(['node2'])
++        self.compute2 = self.start_service('compute', host='node2')
++
++        self.addCleanup(fake.restore_nodes)
++        fake_network.set_stub_network_methods(self)
++
++        payload = {'aggregate': {'name': 'rack1'}}
++        self.agg1 = self.admin_api.post_aggregate(payload)
++        payload = {'aggregate': {'name': 'rack2'}}
++        self.agg2 = self.admin_api.post_aggregate(payload)
++
++        ctxt = context.get_admin_context()
++        self.agg_api.add_host_to_aggregate(ctxt, self.agg1['id'], 'node1')
++        self.agg_api.add_host_to_aggregate(ctxt, self.agg2['id'], 'node2')
++
++    def _create_server_group(self, payload):
++        # We need to do this because _boot_a_server_to_group() ends up calling
++        # the images API, and if we set the test case class's microversion
++        # attribute to 2.43, then we will blow up the call to images API (which
++        # was removed in 2.35). yay.
++        self.api.microversion = '2.43'
++        group = self.api.post_server_groups(payload)
++        self.api.microversion = None
++        return group
++
++    def test_aggregate_affinity(self):
++        """Create a server group with a policy of aggregate-affinity, launch
++        one instance into this group. Launch another instance into the same
++        group and ensure that the instance ends up on a host with the same
++        aggregate as the first instance's destination compute node.
++        """
++        group_name = 'keep-in-rack'
++        group_payload = {
++            'name': group_name,
++            'policies': ['aggregate-affinity'],
++        }
++        group = self._create_server_group(group_payload)
++        inst1 = self._boot_a_server_to_group(group)
++        inst2 = self._boot_a_server_to_group(group)
++
++        self.assertEqual(_host_from_instance(inst1),
++                         _host_from_instance(inst2))
++
++    def test_aggregate_anti_affinity(self):
++        """Create a server group with a policy of aggregate-anti-affinity,
++        launch one instance into this group. Launch another instance into the
++        same group and ensure that the instance ends up on a host in a
++        different aggregate as the first instance's destination compute node.
++        """
++        group_name = 'not-in-rack'
++        group_payload = {
++            'name': group_name,
++            'policies': ['aggregate-anti-affinity'],
++        }
++        group = self._create_server_group(group_payload)
++        inst1 = self._boot_a_server_to_group(group)
++        inst2 = self._boot_a_server_to_group(group)
++
++        self.assertNotEqual(_host_from_instance(inst1),
++                            _host_from_instance(inst2))
+-- 
+2.16.1
+

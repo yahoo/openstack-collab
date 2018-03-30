@@ -1,0 +1,215 @@
+From 0f820a60994586debef47a59ebf8d9eef225b69c Mon Sep 17 00:00:00 2001
+From: Roman Dobosz <roman.dobosz@intel.com>
+Date: Wed, 27 Dec 2017 13:51:25 +0100
+Subject: [PATCH 1/9] allow compute nodes to be associated with host agg
+
+This is basically an Ocata backport patch from Jay Pipes:
+https://review.openstack.org/#/c/526753
+---
+ nova/compute/api.py                                |  36 +++++-
+ nova/tests/functional/compute/__init__.py          |   0
+ .../tests/functional/compute/test_aggregate_api.py | 127 +++++++++++++++++++++
+ 3 files changed, 159 insertions(+), 4 deletions(-)
+ create mode 100644 nova/tests/functional/compute/__init__.py
+ create mode 100644 nova/tests/functional/compute/test_aggregate_api.py
+
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index 6f1371b45f..39437e6c16 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -4548,6 +4548,31 @@ class AggregateAPI(base.Base):
+             availability_zones.update_host_availability_zone_cache(context,
+                                                                    host_name)
+ 
++    def _service_or_compute_node_exists(self, ctx, host_or_node):
++        """Returns True if a service host or compute node record could be found
++        for the supplied host_or_node string. We first check to see if a
++        service record can be found with the host matching the host_or_node
++        parameter by looking at the host mapping records in the API database.
++        If we don't find a service record there, we then ask all cell databases
++        to find a compute node with a hypervisor_hostname matching the supplied
++        host_or_node parameter.
++        """
++        # NOTE(gryf): we don't handle cells in Ocata yet
++        try:
++            objects.Service.get_by_compute_host(ctx, host_or_node)
++            return True
++        except exception.ComputeHostNotFound:
++            pass
++
++        found_nodes = (len(objects.ComputeNodeList
++                           .get_by_hypervisor(ctx, host_or_node)))
++
++        if found_nodes > 1:
++            LOG.debug("Searching for compute nodes matching %s "
++                      "found %d results but expected 1 result.",
++                      host_or_node, len(found_nodes))
++        return found_nodes == 1
++
+     @wrap_exception()
+     def add_host_to_aggregate(self, context, aggregate_id, host_name):
+         """Adds the host to an aggregate."""
+@@ -4556,8 +4581,9 @@ class AggregateAPI(base.Base):
+         compute_utils.notify_about_aggregate_update(context,
+                                                     "addhost.start",
+                                                     aggregate_payload)
+-        # validates the host; ComputeHostNotFound is raised if invalid
+-        objects.Service.get_by_compute_host(context, host_name)
++
++        if not self._service_or_compute_node_exists(context, host_name):
++            raise exception.ComputeHostNotFound(host=host_name)
+ 
+         aggregate = objects.Aggregate.get_by_id(context, aggregate_id)
+         self.is_safe_to_update_az(context, aggregate.metadata,
+@@ -4583,8 +4609,10 @@ class AggregateAPI(base.Base):
+         compute_utils.notify_about_aggregate_update(context,
+                                                     "removehost.start",
+                                                     aggregate_payload)
+-        # validates the host; ComputeHostNotFound is raised if invalid
+-        objects.Service.get_by_compute_host(context, host_name)
++
++        if not self._service_or_compute_node_exists(context, host_name):
++            raise exception.ComputeHostNotFound(host=host_name)
++
+         aggregate = objects.Aggregate.get_by_id(context, aggregate_id)
+         aggregate.delete_host(host_name)
+         self.scheduler_client.update_aggregates(context, [aggregate])
+diff --git a/nova/tests/functional/compute/__init__.py b/nova/tests/functional/compute/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/nova/tests/functional/compute/test_aggregate_api.py b/nova/tests/functional/compute/test_aggregate_api.py
+new file mode 100644
+index 0000000000..7946fddcfe
+--- /dev/null
++++ b/nova/tests/functional/compute/test_aggregate_api.py
+@@ -0,0 +1,127 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++from nova.compute import api as compute_api
++from nova import context
++from nova import exception
++from nova import objects
++from nova import test
++from nova.tests import fixtures as nova_fixtures
++from nova.tests import uuidsentinel as uuids
++
++
++class ComputeAggregateAPIMultiCellTestCase(test.NoDBTestCase):
++    """Tests for the AggregateAPI with multiple cells allowing either service
++    hosts or compute nodes to be associated with an aggregate.
++    """
++
++    USES_DB_SELF = True
++
++    def setUp(self):
++        super(ComputeAggregateAPIMultiCellTestCase, self).setUp()
++        self.agg_api = compute_api.AggregateAPI()
++        self.useFixture(nova_fixtures.Database(database='api'))
++        celldbs = nova_fixtures.CellDatabases()
++        celldbs.add_cell_database(objects.CellMapping.CELL0_UUID, default=True)
++        self.useFixture(celldbs)
++
++        self.ctxt = context.get_admin_context()
++        cell0 = objects.CellMapping(
++            context=self.ctxt, uuid=objects.CellMapping.CELL0_UUID,
++            database_connection=objects.CellMapping.CELL0_UUID,
++            transport_url='none:///')
++        cell0.create()
++        self.cell_mappings = (cell0,)
++
++        # create two Ironic nodes
++        for id_ in (1, 2):
++            hostname = 'ironic_host_%s' % id_
++            with context.target_cell(self.ctxt, cell0) as cctxt:
++                svc = objects.Service(cctxt, host=hostname,
++                                      binary='nova-compute',
++                                      topic='nova-compute')
++                svc.create()
++
++            nodename = 'ironic_node_%s' % id_
++            compute_node_uuid = getattr(uuids, nodename)
++            node = objects.ComputeNode(
++                cctxt, uuid=compute_node_uuid, host=hostname,
++                vcpus=2, memory_mb=2048, local_gb=128, vcpus_used=0,
++                memory_mb_used=0, local_gb_used=0, cpu_info='{}',
++                hypervisor_type='ironic', hypervisor_version=10,
++                hypervisor_hostname=nodename)
++            node.create()
++
++        # create a compute node for VMs along with a corresponding nova-compute
++        # service host in cell1
++        with context.target_cell(self.ctxt, cell0) as cctxt:
++            hostname = 'vm_host_1'
++            svc = objects.Service(cctxt, host=hostname,
++                                  binary='nova-compute',
++                                  topic='nova-compute')
++            svc.create()
++            compute_node_uuid = getattr(uuids, hostname)
++            node = objects.ComputeNode(
++                cctxt, uuid=compute_node_uuid, host=hostname,
++                vcpus=2, memory_mb=2048, local_gb=128, vcpus_used=0,
++                memory_mb_used=0, local_gb_used=0, cpu_info='{}',
++                hypervisor_type='libvirt', hypervisor_version=10,
++                hypervisor_hostname=hostname)
++            node.create()
++
++    def test_service_hostname(self):
++        """Test to make sure we can associate and disassociate an aggregate
++        with a service host.
++        """
++        agg = objects.Aggregate(self.ctxt, name="rack1_baremetal")
++        agg.create()
++
++        agg_id = agg.id
++
++        # There is no such service host called unknown_host_cell1, so should
++        # get back a ComputeHostNotFound
++        self.assertRaises(exception.ComputeHostNotFound,
++                          self.agg_api.add_host_to_aggregate, self.ctxt,
++                          agg_id, 'unknown_host_cell1')
++        self.assertRaises(exception.ComputeHostNotFound,
++                          self.agg_api.remove_host_from_aggregate, self.ctxt,
++                          agg_id, 'unknown_host_cell1')
++
++        hosts = ('ironic_host_1', 'vm_host_1')
++        for service_host in hosts:
++            self.agg_api.add_host_to_aggregate(self.ctxt, agg_id, service_host)
++            self.agg_api.remove_host_from_aggregate(self.ctxt, agg_id,
++                                                    service_host)
++
++    def test_compute_nodename(self):
++        """Test to make sure we can associate and disassociate an aggregate
++        with a compute node by its hypervisor_hostname.
++        """
++        agg = objects.Aggregate(self.ctxt, name="rack1_baremetal")
++        agg.create()
++
++        agg_id = agg.id
++
++        # There is no such compute node called unknown_host_cell1, so should
++        # get back a ComputeHostNotFound
++        self.assertRaises(exception.ComputeHostNotFound,
++                          self.agg_api.add_host_to_aggregate, self.ctxt,
++                          agg_id, getattr(uuids, 'unknown_node_cell1'))
++        self.assertRaises(exception.ComputeHostNotFound,
++                          self.agg_api.remove_host_from_aggregate, self.ctxt,
++                          agg_id, getattr(uuids, 'unknown_host_cell1'))
++
++        nodenames = ('ironic_node_2', 'ironic_node_1', 'vm_host_')
++        for nodename in nodenames:
++            self.agg_api.add_host_to_aggregate(self.ctxt, agg_id, nodename)
++            self.agg_api.remove_host_from_aggregate(self.ctxt, agg_id,
++                                                    nodename)
+-- 
+2.16.1
+

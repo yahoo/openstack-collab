@@ -1,0 +1,170 @@
+From 9014195f11d981da4dc158ab9b9b6bb594c8ea0d Mon Sep 17 00:00:00 2001
+From: Roman Dobosz <roman.dobosz@intel.com>
+Date: Fri, 23 Feb 2018 07:26:05 +0100
+Subject: [PATCH 5/9] Added node field for InstanceGroup objects
+
+Currently, there is only a way for getting the information which hosts
+belongs for certain instance group. By 'hosts' it means a hostname, on
+which compute service is running. In case of bare metal instances, there
+is no way to get the information out of instance group object which
+ironic nodes are belonging for such group. This patch adds an ability
+for fetching such information.
+
+InstanceGroup class now have new field - nodes - and corresponding method
+get_nodes, to gather information about nodes  out of instance objects. Also
+request spec object was updated to reset new InstanceGroup nodes field during
+group population.
+---
+ nova/objects/instance_group.py                  | 34 ++++++++++++++++++++-----
+ nova/objects/request_spec.py                    |  5 ++--
+ nova/tests/functional/db/test_instance_group.py |  2 +-
+ nova/tests/unit/objects/test_instance_group.py  |  6 +++--
+ nova/tests/unit/objects/test_objects.py         |  2 +-
+ 5 files changed, 37 insertions(+), 12 deletions(-)
+
+diff --git a/nova/objects/instance_group.py b/nova/objects/instance_group.py
+index 2be47278b2..142fff6128 100644
+--- a/nova/objects/instance_group.py
++++ b/nova/objects/instance_group.py
+@@ -32,7 +32,7 @@ from nova.objects import base
+ from nova.objects import fields
+ 
+ 
+-LAZY_LOAD_FIELDS = ['hosts']
++LAZY_LOAD_FIELDS = ['hosts', 'nodes']
+ 
+ 
+ def _instance_group_get_query(context, id_field=None, id=None):
+@@ -124,7 +124,8 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject,
+     # Version 1.9: Add get_by_instance_uuid()
+     # Version 1.10: Add hosts field
+     # Version 1.11: Add get_aggregate_uuids()
+-    VERSION = '1.11'
++    # Version 1.12: Add nodes field
++    VERSION = '1.12'
+ 
+     fields = {
+         'id': fields.IntegerField(),
+@@ -138,6 +139,7 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject,
+         'policies': fields.ListOfStringsField(nullable=True),
+         'members': fields.ListOfStringsField(nullable=True),
+         'hosts': fields.ListOfStringsField(nullable=True),
++        'nodes': fields.ListOfStringsField(nullable=True),
+         }
+ 
+     def obj_make_compatible(self, primitive, target_version):
+@@ -283,12 +285,13 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject,
+ 
+     def obj_load_attr(self, attrname):
+         # NOTE(sbauza): Only hosts could be lazy-loaded right now
+-        if attrname != 'hosts':
++        if attrname not in LAZY_LOAD_FIELDS:
+             raise exception.ObjectActionError(
+                 action='obj_load_attr', reason='unable to load %s' % attrname)
+ 
+         self.hosts = self.get_hosts()
+-        self.obj_reset_changes(['hosts'])
++        self.nodes = self.get_nodes()
++        self.obj_reset_changes(LAZY_LOAD_FIELDS)
+ 
+     @base.remotable_classmethod
+     def get_by_uuid(cls, context, uuid):
+@@ -348,8 +351,9 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject,
+         # field explicitly, we prefer to raise an Exception so the developer
+         # knows he has to call obj_reset_changes(['hosts']) right after setting
+         # the field.
+-        if 'hosts' in updates:
+-            raise exception.InstanceGroupSaveException(field='hosts')
++        for attribute in LAZY_LOAD_FIELDS:
++            if attribute in updates:
++                raise exception.InstanceGroupSaveException(field=attribute)
+ 
+         if not updates:
+             return
+@@ -456,6 +460,24 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject,
+         return list(set([instance.host for instance in instances
+                          if instance.host]))
+ 
++    @base.remotable
++    def get_nodes(self, exclude=None):
++        """Get a list of nodes for non-deleted instances in the group
++
++        This method allows you to get a list of the (ironic) hosts where
++        instances in this group are currently running.  There's also an option
++        to exclude certain instance UUIDs from this calculation.
++
++        """
++        filter_uuids = self.members
++        if exclude:
++            filter_uuids = set(filter_uuids) - set(exclude)
++        filters = {'uuid': filter_uuids, 'deleted': False}
++        instances = objects.InstanceList.get_by_filters(self._context,
++                                                        filters=filters)
++        return list(set([instance.node for instance in instances
++                         if instance.node]))
++
+     @base.remotable
+     def get_aggregate_uuids(self, exclude=None):
+         """Returns a set of aggregate UUIDs associated with all compute nodes
+diff --git a/nova/objects/request_spec.py b/nova/objects/request_spec.py
+index 9040735153..24eaef9327 100644
+--- a/nova/objects/request_spec.py
++++ b/nova/objects/request_spec.py
+@@ -200,8 +200,9 @@ class RequestSpec(base.NovaObject):
+             self.instance_group = objects.InstanceGroup(policies=policies,
+                                                         hosts=hosts,
+                                                         members=members)
+-            # hosts has to be not part of the updates for saving the object
+-            self.instance_group.obj_reset_changes(['hosts'])
++            # hosts and nodes cannot be a part of the updates for saving the
++            # object
++            self.instance_group.obj_reset_changes(['hosts', 'nodes'])
+         else:
+             # Set the value anyway to avoid any call to obj_attr_is_set for it
+             self.instance_group = None
+diff --git a/nova/tests/functional/db/test_instance_group.py b/nova/tests/functional/db/test_instance_group.py
+index b4c7ef3fd8..3c608b929f 100644
+--- a/nova/tests/functional/db/test_instance_group.py
++++ b/nova/tests/functional/db/test_instance_group.py
+@@ -221,7 +221,7 @@ class InstanceGroupObjectTestCase(test.TestCase):
+         api_models = sorted(api_models, key=key_func)
+         orig_main_models = sorted(orig_main_models, key=key_func)
+         ignore_fields = ('id', 'hosts', 'deleted', 'deleted_at', 'created_at',
+-                         'updated_at')
++                         'updated_at', 'nodes')
+         for i in range(len(api_models)):
+             for field in instance_group.InstanceGroup.fields:
+                 if field not in ignore_fields:
+diff --git a/nova/tests/unit/objects/test_instance_group.py b/nova/tests/unit/objects/test_instance_group.py
+index 8da6712f6e..37a71b57ce 100644
+--- a/nova/tests/unit/objects/test_instance_group.py
++++ b/nova/tests/unit/objects/test_instance_group.py
+@@ -271,8 +271,10 @@ class _TestInstanceGroupObject(object):
+ 
+     @mock.patch.object(objects.InstanceList, 'get_by_filters')
+     def test_load_hosts(self, mock_get_by_filt):
+-        mock_get_by_filt.return_value = [objects.Instance(host='host1'),
+-                                         objects.Instance(host='host2')]
++        mock_get_by_filt.return_value = [objects.Instance(host='host1',
++                                                          node='node1'),
++                                         objects.Instance(host='host2',
++                                                          node='node2')]
+ 
+         obj = objects.InstanceGroup(self.context, members=['uuid1'])
+         self.assertEqual(2, len(obj.hosts))
+diff --git a/nova/tests/unit/objects/test_objects.py b/nova/tests/unit/objects/test_objects.py
+index a577820d0c..f80182357c 100644
+--- a/nova/tests/unit/objects/test_objects.py
++++ b/nova/tests/unit/objects/test_objects.py
+@@ -1106,7 +1106,7 @@ object_data = {
+     'InstanceExternalEvent': '1.1-6e446ceaae5f475ead255946dd443417',
+     'InstanceFault': '1.2-7ef01f16f1084ad1304a513d6d410a38',
+     'InstanceFaultList': '1.2-6bb72de2872fe49ded5eb937a93f2451',
+-    'InstanceGroup': '1.11-bdd9fa6ab3c80e92fd43b3ba5393e368',
++    'InstanceGroup': '1.12-4eaaffc4d20d0901cd0cfaef9e8a41cd',
+     'InstanceGroupList': '1.7-be18078220513316abd0ae1b2d916873',
+     'InstanceInfoCache': '1.5-cd8b96fefe0fc8d4d337243ba0bf0e1e',
+     'InstanceList': '2.2-ff71772c7bf6d72f6ef6eee0199fb1c9',
+-- 
+2.16.1
+

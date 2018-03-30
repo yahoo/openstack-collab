@@ -1,0 +1,22 @@
+From 908c71544de1323e109cfec66f146ea68a71d91f Mon Sep 17 00:00:00 2001
+From: Roman Dobosz <roman.dobosz@intel.com>
+Date: Fri, 23 Feb 2018 12:45:01 +0100
+Subject: [PATCH] Bump novaclient API version to 2.43
+
+---
+ novaclient/__init__.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/novaclient/__init__.py b/novaclient/__init__.py
+index 0816b4f6..61377cca 100644
+--- a/novaclient/__init__.py
++++ b/novaclient/__init__.py
+@@ -25,4 +25,4 @@ API_MIN_VERSION = api_versions.APIVersion("2.1")
+ # when client supported the max version, and bumped sequentially, otherwise
+ # the client may break due to server side new version may include some
+ # backward incompatible change.
+-API_MAX_VERSION = api_versions.APIVersion("2.41")
++API_MAX_VERSION = api_versions.APIVersion("2.43")
+-- 
+2.16.1
+

@@ -1,0 +1,57 @@
+From 3e4ef01cb6f3fa5545cd3be31d84295d65f73fa7 Mon Sep 17 00:00:00 2001
+From: Roman Dobosz <roman.dobosz@intel.com>
+Date: Fri, 23 Feb 2018 09:19:54 +0000
+Subject: [PATCH 6/9] Add ability to search aggregate map via ironic node as a
+ key in HostManager
+
+With this change now it will be possible for mapping nodes with aggregate.
+Changed signature of _get_aggregates_info in scheduler HostManager class to be
+able to accept compute object as a parameter, so that in HostManager (base
+class) aggregate map will be searched by host, while in IronicHostManager
+(subclass) it will search by hypervisor_hostname - which is the UUID of the
+node, and which is stored as an member of aggregate.
+---
+ nova/scheduler/host_manager.py        | 6 +++---
+ nova/scheduler/ironic_host_manager.py | 4 ++++
+ 2 files changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/nova/scheduler/host_manager.py b/nova/scheduler/host_manager.py
+index 7347722a94..8612a36328 100644
+--- a/nova/scheduler/host_manager.py
++++ b/nova/scheduler/host_manager.py
+@@ -631,7 +631,7 @@ class HostManager(object):
+             # happening after setting this field for the first time
+             host_state.update(compute,
+                               dict(service),
+-                              self._get_aggregates_info(host),
++                              self._get_aggregates_info(compute),
+                               self._get_instance_info(context, compute))
+ 
+             seen_nodes.add(state_key)
+@@ -652,9 +652,9 @@ class HostManager(object):
+         return (self.host_state_map[host] for host in seen_nodes
+                 if host in self.host_state_map)
+ 
+-    def _get_aggregates_info(self, host):
++    def _get_aggregates_info(self, compute):
+         return [self.aggs_by_id[agg_id] for agg_id in
+-                self.host_aggregates_map[host]]
++                self.host_aggregates_map[compute.host]]
+ 
+     def _get_instance_info(self, context, compute):
+         """Gets the host instance info from the compute host.
+diff --git a/nova/scheduler/ironic_host_manager.py b/nova/scheduler/ironic_host_manager.py
+index 5156ed6df9..c703a810a9 100644
+--- a/nova/scheduler/ironic_host_manager.py
++++ b/nova/scheduler/ironic_host_manager.py
+@@ -123,3 +123,7 @@ class IronicHostManager(host_manager.HostManager):
+         else:
+             return super(IronicHostManager, self)._get_instance_info(context,
+                                                                      compute)
++
++    def _get_aggregates_info(self, compute):
++        return [self.aggs_by_id[agg_id] for agg_id in
++                self.host_aggregates_map[compute.hypervisor_hostname]]
+-- 
+2.16.1
+

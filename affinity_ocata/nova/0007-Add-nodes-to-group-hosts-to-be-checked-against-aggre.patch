@@ -1,0 +1,32 @@
+From 6f8af77366402aca0555005abe469b29509d0eb3 Mon Sep 17 00:00:00 2001
+From: Roman Dobosz <roman.dobosz@intel.com>
+Date: Fri, 23 Feb 2018 11:28:52 +0000
+Subject: [PATCH 7/9] Add nodes to group hosts to be checked against
+ aggregation
+
+Currently, only hostnames (which origin from machine, on which compute service
+is running, and which belong to the requested group) was checked against host
+aggregates. This patch adds also instance_group.nodes to the set of the keys
+being a criteria for a search in aggregates.
+---
+ nova/scheduler/filters/affinity_filter.py | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/nova/scheduler/filters/affinity_filter.py b/nova/scheduler/filters/affinity_filter.py
+index f025df45df..587293f832 100644
+--- a/nova/scheduler/filters/affinity_filter.py
++++ b/nova/scheduler/filters/affinity_filter.py
+@@ -177,8 +177,8 @@ class ServerGroupAggregateAffinityFilter(filters.BaseHostFilter):
+                 # constraint
+                 return True
+ 
+-        group_hosts = (spec_obj.instance_group.hosts
+-                       if spec_obj.instance_group else [])
++        group_hosts = set(spec_obj.instance_group.nodes +
++                          spec_obj.instance_group.hosts)
+         if not group_hosts:
+             # There are no members of the server group yet, so this host meets
+             # the aggregate affinity (or anti-affinity) constraint
+-- 
+2.16.1
+

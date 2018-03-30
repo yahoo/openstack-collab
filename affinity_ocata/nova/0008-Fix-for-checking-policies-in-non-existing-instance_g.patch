@@ -1,0 +1,25 @@
+From 72af3e6b58c3a732549b40fbb24067a41c7065ac Mon Sep 17 00:00:00 2001
+From: Roman Dobosz <roman.dobosz@intel.com>
+Date: Fri, 23 Feb 2018 11:37:16 +0000
+Subject: [PATCH 8/9] Fix for checking policies in non existing instance_group
+
+---
+ nova/scheduler/filters/affinity_filter.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/nova/scheduler/filters/affinity_filter.py b/nova/scheduler/filters/affinity_filter.py
+index 587293f832..a316aafbcb 100644
+--- a/nova/scheduler/filters/affinity_filter.py
++++ b/nova/scheduler/filters/affinity_filter.py
+@@ -158,7 +158,7 @@ class ServerGroupAggregateAffinityFilter(filters.BaseHostFilter):
+     REVERSE_CHECK = False
+ 
+     def host_passes(self, host_state, spec_obj):
+-        if not spec_obj.instance_group.policies:
++        if not (spec_obj.instance_group and spec_obj.instance_group.policies):
+             return True
+         policy = spec_obj.instance_group.policies[0]
+         if self.POLICY_NAME != policy:
+-- 
+2.16.1
+
