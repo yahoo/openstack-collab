@@ -1,0 +1,922 @@
+From b8287f42a8553ed63a1282f8b63a04d5d9314cf7 Mon Sep 17 00:00:00 2001
+From: "Grzegorz Grasza (xek)" <grzegorz.grasza@intel.com>
+Date: Fri, 9 Mar 2018 13:33:08 +0100
+Subject: [PATCH 10/11] HP Hardware RAID setup implementation
+
+Co-Authored-By: Piotr Prokop <piotr.prokop@intel.com>
+---
+ ironic_lib/system_installer/hpssaclisetup.py       | 374 ++++++++++++++++-
+ .../examples/ssacli_outputs/ld_show_detail.txt     |  44 ++
+ ironic_lib/tests/test_hpraid.py                    | 457 +++++++++++++++++++++
+ 3 files changed, 874 insertions(+), 1 deletion(-)
+ create mode 100644 ironic_lib/tests/examples/ssacli_outputs/ld_show_detail.txt
+ create mode 100644 ironic_lib/tests/test_hpraid.py
+
+diff --git a/ironic_lib/system_installer/hpssaclisetup.py b/ironic_lib/system_installer/hpssaclisetup.py
+index 9cbecf2..38dc318 100644
+--- a/ironic_lib/system_installer/hpssaclisetup.py
++++ b/ironic_lib/system_installer/hpssaclisetup.py
+@@ -13,14 +13,386 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import re
++import subprocess
++
++from oslo_log import log
++
+ from ironic_lib.system_installer.base import Setup
++from ironic_lib.system_installer import exceptions
++from ironic_lib.system_installer import partitionsetup
++from ironic_lib.system_installer import tools
++
++LOG = log.getLogger()
+ 
+ 
+ class HpSsaCliSetup(Setup):
+     """Hardware RAID setup implementation"""
+ 
++    default_stripe_size = 64
+     conf_key = 'hwraid'
++    UNASSIGNED = 'Unassigned'
++
++    def __init__(self, conf):
++        super(HpSsaCliSetup, self).__init__(conf)
++        self.conf_part = conf
++
++    # ssacli ctrl all show
++    @classmethod
++    def _get_controllers(self):
++        """Get the list of HP RAID controllers
++
++        Returns list of controllers' slot ids
++        """
++
++        output = subprocess.check_output(['ssacli', 'ctrl', 'all', 'show'])
++        controllers = []
++        for line in output.split('\n'):
++            if not line:
++                continue
++
++            # Smart Array P410 in Slot 4                (sn: PACCRID12490C7R)
++            re_slot = re.match('Smart\sArray\s[a-zA-Z0-9]+\sin\sSlot\s(\d+)',
++                               line)
++            if re_slot:
++                slot = str(re_slot.groups()[0])
++                controllers.append(slot)
++
++        return controllers
++
++    # ssacli ctrl slot=4 pd all show
++    def _get_pd_in_controllers(self):
++
++        """Get physical drives in each controller
++
++        Return: dictionary where key is controller's id and value is a list
++        of physical drives managed by this controller
++        """
++
++        mapping = {}
++        for controller in self._get_controllers():
++            mapping[controller] = []
++            output = subprocess.check_output(['ssacli', 'ctrl',
++                                              'slot={}'.format(controller),
++                                              'pd', 'all', 'show'])
++
++            # physicaldrive 2I:1:1 (port 2I:box 1:bay 1, SAS HDD, 300 GB, OK)
++            for line in output.split('\n'):
++                re_pd = re.match('physicaldrive\s([A-Z0-9]+:\d+:\d+)',
++                                 line.strip())
++                if re_pd:
++                    mapping[controller].append(re_pd.groups()[0])
++
++        return mapping
++
++    #  ssacli ctrl slot=4 ld all show
++    @classmethod
++    def _get_array_to_ld(self):
++
++        """Get logical drives and their array identifier
++
++        Return: dictionary with ld id and its array identifier
++        """
++
++        mapping = {}
++        for controller in self._get_controllers():
++            mapping[controller] = {}
++            array = None
++            output = subprocess.check_output(['ssacli', 'ctrl',
++                                              'slot={}'.format(controller),
++                                              'ld', 'all', 'show'])
++
++            for line in output.split('\n'):
++                #    Array A
++                #        logicaldrive 1 (558.7 GB, RAID 5, OK)
++                re_array = re.match('Array\s([A-Z])', line.strip())
++                if re_array:
++                    array = re_array.groups()[0]
++                    continue
++
++                re_id = re.match('logicaldrive\s(\d+) ', line.strip())
++                if re_id and array:
++                    ld_id = re_id.groups()[0]
++                    mapping[controller][array] = str(ld_id)
++                    array = None
++                    continue
++
++        return mapping
++
++    @classmethod
++    def _get_pds_in_lds(self):
++        """Get physical drives that logical drive consists of"""
++
++        mapping = {}
++        lds = self._get_array_to_ld()
++
++        for controller in self._get_controllers():
++            mapping[controller] = {}
++            output = subprocess.check_output(['ssacli', 'ctrl',
++                                              'slot={}'.format(controller),
++                                              'pd', 'all', 'show'])
++
++            array = ld = None
++            # physicaldrive 2I:1:1 (port 2I:box 1:bay 1, SAS HDD, 300 GB, OK)
++            for line in output.split('\n'):
++                #    Array A
++                #        logicaldrive 1 (558.7 GB, RAID 5, OK)
++                re_array = re.match('Array\s([A-Z])', line.strip())
++                if re_array:
++                    array = re_array.groups()[0]
++                    ld = lds[controller][array]
++                    mapping[controller][ld] = []
++                    continue
++
++                # If PD is not in Array it can be unassigned
++                elif line.strip() == self.UNASSIGNED:
++                    ld = self.UNASSIGNED
++                    mapping[controller][ld] = []
++                    continue
++
++                re_pd = re.match('physicaldrive\s([A-Z0-9]+:\d+:\d+)',
++                                 line.strip())
++
++                if re_pd and array:
++                    pd = re_pd.groups()[0]
++                    mapping[controller][ld].append(pd)
++                    continue
++
++        return mapping
++
++    # ssacli ctrl slot=4 create type=ld drives=2I:1:1,2I:1:2,2I:1:3 raid=5
++    # logicaldrivelabel=raid5
++    def _make_raid(self, pds, raidtype, stripe_size, controller, label,
++                   pds_in_lds):
++        """Make RAID"""
++        if raidtype == 10:
++            raidtype = '1+0'
++
++        for pd in pds:
++            ld = [ld for ld in pds_in_lds[controller] if pd in
++                  pds_in_lds[controller][ld]]
++            if len(ld) != 1:
++                raise exceptions.EnvError('Physical Disk {} is not a'
++                                          ' JBOD'.format(pd))
++
++            # we assume all disks are JBOD(single disk RAID0)
++            # so  we delete them to be able to made a
++            # new RAID from those disks
++            self._delete_raid(ld[0], controller)
++
++        subprocess.check_call(['ssacli', 'ctrl', 'slot={}'.format(controller),
++                               'create', 'type=ld',
++                               'drives={}'.format(",".join(pds)),
++                               'raid={}'.format(raidtype),
++                               'logicaldrivelabel={}'.format(label),
++                               'stripsize={}'.format(stripe_size)])
++
++    # ssacli ctrl slot=4 ld 1 delete forced
++    @classmethod
++    def _delete_raid(self, ld, controller):
++        """Delete RAID"""
++        subprocess.check_call(['ssacli', 'ctrl', 'slot={}'.format(controller),
++                               'ld', ld, 'delete', 'forced'])
++
++    # ssacli ctrl slot=4 create type=arrayr0 drives=2I:1:1,2I:1:2,2I:1:3
++    @classmethod
++    def _make_disks_jbod(self, pds, controller):
++        """Make each disk RAID0"""
++        subprocess.check_call(['ssacli', 'ctrl', 'slot={}'.format(controller),
++                               'create', 'type=arrayr0',
++                               'drives={}'.format(','.join(pds))])
++
++    @classmethod
++    def _get_lds_info(self):
++
++        """Get logical drives and their array identifier
++
++        Return: dictionary with ld id and its array identifier
++        """
++        mapping = {}
++        pds = self._get_pds_in_lds()
++        for controller in self._get_controllers():
++            mapping[controller] = {}
++            ld_id = disk = label = raidtype = None
++            output = subprocess.check_output(['ssacli', 'ctrl',
++                                              'slot={}'.format(controller),
++                                              'ld', 'all', 'show', 'detail'])
++
++            for line in output.split('\n'):
++                #    Array A
++                #        logicaldrive 1 (558.7 GB, RAID 5, OK)
++
++                re_id = re.match('Logical\sDrive:\s(\d+)', line.strip())
++                if re_id:
++                    ld_id = re_id.groups()[0]
++                    mapping[controller][ld_id] = {}
++                    # label is not mandatory, default it to None
++                    mapping[controller][ld_id]['label'] = None
++                    disks_num = len(pds[controller][ld_id])
++                    mapping[controller][ld_id]['disks_num'] = disks_num
++                    continue
++
++                if not ld_id:
++                    continue
++
++                re_raidtype = re.match('Fault\sTolerance:\s([0-9\+]+)',
++                                       line.strip())
++                if re_raidtype:
++                    raidtype = re_raidtype.groups()[0]
++                    if raidtype == '1+0':
++                        raidtype = 10
++
++                    mapping[controller][ld_id]['raidtype'] = int(raidtype)
++                    continue
++
++                re_disk = re.match('Disk\sName:\s([\/a-z]+)', line.strip())
++                if re_disk:
++                    disk = re_disk.groups()[0]
++                    mapping[controller][ld_id]['disk'] = disk
++                    continue
++
++                re_label = re.match('Logical\sDrive\sLabel:\s([0-9a-zA-Z]+)',
++                                    line.strip())
++                if re_label:
++                    label = re_label.groups()[0]
++                    mapping[controller][ld_id]['label'] = label
++                    continue
++
++        return mapping
++
++    def validate_conf(self):
++        """Validate the contents of self.conf.
++
++        Raises: ironic_lib.system_installer.exceptions.ConfError.
++        """
++        for raid in self.conf.keys():
++            raidtype = self.conf[raid]['raidtype']
++            # logical disks to make RAID from
++            partitions = self.conf[raid]['partitions']
++            if not tools.validate_raid(raidtype, partitions):
++                raise exceptions.ConfError('Raid {} cannot be created,'
++                                           'too few disks specified or its '
++                                           'number is not'
++                                           ' even'.format(raidtype))
++
++            stripe_size = int(self.conf[raid].get('stripe_size', 0))
++            if stripe_size and stripe_size not in [64, 128, 256, 512, 1024]:
++                raise exceptions.ConfError('Unsupported stripe_size:'
++                                           ' {}'.format(stripe_size))
++
++    def validate_env(self):
++
++        """Validate environment, check available commands and devices"""
++        # check if there is ssacli binary
++        subprocess.check_call(['which', 'ssacli'])
++        # check if this machine has any HP controller
++        if len(self._get_controllers()) < 1:
++            raise exceptions.EnvError('No HP RAID controller found')
++
++    def get_src_names(self):
++        """Return a list of source device/filesystem names."""
++        src = []
++        for raid in self.conf.keys():
++            src.extend(self.conf[raid]['partitions'])
++
++        return src
++
++    def get_dst_names(self):
++        """Return a list of device/filesystem names that will be created."""
++        return [raid for raid in self.conf.keys()]
++
++    def _get_disk_with_label(self, lds, raid, controller):
++        """Return physical disk with specified label"""
++        for ld in lds[controller]:
++            if lds[controller][ld]['label'] == raid:
++                return lds[controller][ld]['disk']
++
++        raise exceptions.EnvError('Couldnt find disk with label'
++                                  ' {}'.format(raid))
++
++    @classmethod
++    def clean_disks(self, excluded_devices):
++
++        """Clean all raids except for excluded ones.
++
++        Create single disk RAID0 arrays -> JBOD for HP out of all physical
++        disks that are not part of any raids.
++        """
++
++        lds = self._get_lds_info()
++        pds = self._get_pds_in_lds()
++        for ctrl in lds:
++            # if there are any Unassigned disks in controller changed them to
++            # JBOD
++            if self.UNASSIGNED in pds[ctrl]:
++                self._make_disks_jbod(pds[ctrl][self.UNASSIGNED], ctrl)
++
++            for ld in lds[ctrl]:
++                # skip cleaning raids in excluded_devices
++                if lds[ctrl][ld]['disk'] in excluded_devices.values():
++                    continue
++
++                raidtype = lds[ctrl][ld]['raidtype']
++                disks_num = lds[ctrl][ld]['disks_num']
++
++                # skip disks that are already JBOD
++                if raidtype == 0 and disks_num == 1:
++                    continue
++
++                LOG.debug('Deleteing raid {} on ctrl {}'.format(ld, ctrl))
++                # delete raid
++                self._delete_raid(ld, ctrl)
++                # transform disks that made ld to JBOD
++                LOG.debug('Making disks: {} on ctrl'
++                          ' JBOD'.format(pds[ctrl][ld], ctrl))
++                self._make_disks_jbod(pds[ctrl][ld], ctrl)
+ 
+     @staticmethod
+     def is_hpraid_controller():
+-        return False
++        try:
++            subprocess.check_call(['which', 'ssacli'])
++            subprocess.check_call(['ssacli', 'ctrl', 'all', 'show'])
++        except subprocess.CalledProcessError:
++            return False
++
++        return True
++
++    def setup_disks(self, devices):
++        """Format disks or setup RAID/LVM. Return created devices dict."""
++        # retrieve mapping between physical disks and adapter:enc pair
++        devices.update(partitionsetup.PartitionSetup(self.conf_part)
++                       .get_not_partitioned_candidates())
++
++        created_raids = {}
++        raids = [raid for raid in self.conf.keys()
++                 if raid not in devices.keys()]
++
++        lds = self._get_lds_info()
++        stripe_size = self.default_stripe_size
++
++        for raid in raids:
++            raidtype = self.conf[raid]['raidtype']
++            # get stripe size
++            if self.conf[raid].get('stripe_size'):
++                stripe_size = int(self.conf[raid].get('stripe_size'))
++
++            # logical disks to make RAID from
++            partitions = self.conf[raid]['partitions']
++            # retrieve controller for disks and validate if all of them are on
++            # one controller
++            controller = tools.get_controller_for_disks(partitions, devices,
++                                                        lds)
++            # get physical drives IDs
++            pds_in_lds = self._get_pds_in_lds()
++            pds = tools.get_pds_for_raid(partitions, devices, controller, lds,
++                                         pds_in_lds)
++            # make raid
++            self._make_raid(pds, raidtype, stripe_size, controller, raid,
++                            pds_in_lds)
++            # reread information about Logical Drives
++            lds = self._get_lds_info()
++            created_raid = self._get_disk_with_label(lds, raid, controller)
++            created_raids[raid] = created_raid
++
++        devices.update(created_raids)
++        return devices
+diff --git a/ironic_lib/tests/examples/ssacli_outputs/ld_show_detail.txt b/ironic_lib/tests/examples/ssacli_outputs/ld_show_detail.txt
+new file mode 100644
+index 0000000..0175ba1
+--- /dev/null
++++ b/ironic_lib/tests/examples/ssacli_outputs/ld_show_detail.txt
+@@ -0,0 +1,44 @@
++
++Smart Array P410 in Slot 4
++
++   Array A
++
++      Logical Drive: 1
++         Size: 558.7 GB
++         Fault Tolerance: 5
++         Heads: 255
++         Sectors Per Track: 32
++         Cylinders: 65535
++         Strip Size: 256 KB
++         Full Stripe Size: 512 KB
++         Status: OK
++         Caching:  Enabled
++         Parity Initialization Status: Queued
++         Unique Identifier: 600508B1001C7EAC6D72CA90F88CF41E
++         Disk Name: /dev/sda
++         Mount Points: None
++         Logical Drive Label: raid5
++         Drive Type: Data
++         LD Acceleration Method: Controller Cache
++
++
++   Array B
++
++      Logical Drive: 4
++         Size: 279.4 GB
++         Fault Tolerance: 0
++         Heads: 255
++         Sectors Per Track: 32
++         Cylinders: 65535
++         Strip Size: 256 KB
++         Full Stripe Size: 256 KB
++         Status: OK
++         Caching:  Enabled
++         Unique Identifier: 600508B1001C6832A52936CC3600547F
++         Disk Name: /dev/sdd
++         Mount Points: None
++         Drive Type: Data
++         LD Acceleration Method: Controller Cache
++
++
++
+diff --git a/ironic_lib/tests/test_hpraid.py b/ironic_lib/tests/test_hpraid.py
+new file mode 100644
+index 0000000..07745c2
+--- /dev/null
++++ b/ironic_lib/tests/test_hpraid.py
+@@ -0,0 +1,457 @@
++# Copyright (c) 2018 Intel Corporation
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++# implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++# import subprocess
++import unittest
++try:
++    from unittest import mock
++except ImportError:
++    import mock
++
++import subprocess
++import yaml
++
++from ironic_lib.system_installer import exceptions
++from ironic_lib.system_installer import HpSsaCliSetup
++from ironic_lib.system_installer import partitionsetup
++
++
++class HpSsaCliSetupTest(unittest.TestCase):
++
++    @mock.patch('subprocess.check_call')
++    def setUp(self, call):
++        with open('ironic_lib/tests/examples/megacli.yml') as f:
++            conf = yaml.load(f)
++        self.hpraid = HpSsaCliSetup(conf['disk_config'])
++
++    @mock.patch('subprocess.check_output')
++    def test_get_controllers_one_controller(self, exe):
++        exe.return_value = '\n'.join(['', 'Smart Array P410 in Slot 4'
++                                      '(sn: PACCRID12490C7R)', ''])
++        self.assertListEqual(['4'], self.hpraid._get_controllers())
++        exe.assert_called_once_with('ssacli ctrl all show'.split())
++
++    @mock.patch('subprocess.check_output')
++    def test_get_controllers_couple_controllers(self, exe):
++        exe.return_value = '\n'.join(['', 'Smart Array P410 in Slot 4'
++                                      '(sn: PACCRID12490C7R)',
++                                      'Smart Array P4200 in Slot 6'
++                                      '(sn: PACCRID10C7R)',
++                                      'Smart Array P40 in Slot 8'
++                                      '(sn: PACCR0C7R)', ''])
++        self.assertListEqual(['4', '6', '8'], self.hpraid._get_controllers())
++        exe.assert_called_once_with('ssacli ctrl all show'.split())
++
++    @mock.patch('subprocess.check_output')
++    def test_get_controllers_no_controllers(self, exe):
++        exe.return_value = '\n'.join(['', ''])
++        self.assertListEqual([], self.hpraid._get_controllers())
++        exe.assert_called_once_with('ssacli ctrl all show'.split())
++
++    @mock.patch.object(HpSsaCliSetup, '_get_controllers')
++    @mock.patch('subprocess.check_output')
++    def test_get_pd_in_controllers(self, exe, controllers):
++        pd_output = ['', 'Smart Array P410 in Slot 4', '',
++                     '  Array A', '',
++                     '      physicaldrive 2I:1:1 (port 2I:box 1:bay'
++                     ' 1, SAS HDD, 300 GB, OK)<Paste>',
++                     '      physicaldrive 2I:1:2 (port 2I:box 1:bay'
++                     '2, SAS HDD, 300 GB, OK)',
++                     '      physicaldrive 2I:1:3 (port 2I:box 1:bay'
++                     '3, SAS HDD, 300 GB, OK)',
++                     '      physicaldrive 2I:1:4 (port 2I:box 1:bay'
++                     '4, SAS HDD, 300 GB, OK)']
++        exe.return_value = '\n'.join(pd_output)
++
++        controllers.return_value = ['4']
++        self.assertDictEqual({'4': ['2I:1:1', '2I:1:2', '2I:1:3', '2I:1:4']},
++                             self.hpraid._get_pd_in_controllers())
++        exe.assert_called_once_with('ssacli ctrl slot=4 pd all show'.split())
++
++    @mock.patch.object(HpSsaCliSetup, '_get_controllers')
++    @mock.patch('subprocess.check_output')
++    def test_get_pd_in_controllers_empty(self, exe, controllers):
++        exe.return_value = '\n'.join(['', 'Smart Array P410 in Slot 4', '',
++                                      '  Array A', ''])
++
++        controllers.return_value = ['4']
++        self.assertDictEqual({'4': []},
++                             self.hpraid._get_pd_in_controllers())
++        exe.assert_called_once_with('ssacli ctrl slot=4 pd all show'.split())
++
++    @mock.patch.object(HpSsaCliSetup, '_get_controllers')
++    @mock.patch('subprocess.check_output')
++    def test_get_array_to_ld(self, exe, controllers):
++        controllers.return_value = ['4']
++        ld_output = ['', 'Smart Array P410 in Slot 4', '', '   Array A', '',
++                     '      logicaldrive 1 (558.7 GB, RAID 5, OK)', '',
++                     '   Array B', '',
++                     '      logicaldrive 4 (279.4 GB, RAID 0, OK)', '']
++
++        exe.return_value = '\n'.join(ld_output)
++        mapping = {'4': {'A': '1', 'B': '4'}}
++        self.assertDictEqual(mapping, self.hpraid._get_array_to_ld())
++
++    @mock.patch.object(HpSsaCliSetup, '_get_controllers')
++    @mock.patch('subprocess.check_output')
++    def test_get_array_to_ld_empty(self, exe, controllers):
++        controllers.return_value = ['4']
++        ld_output = ['', 'Smart Array P410 in Slot 4', '', '']
++
++        exe.return_value = '\n'.join(ld_output)
++        mapping = {'4': {}}
++        self.assertDictEqual(mapping, self.hpraid._get_array_to_ld())
++
++    @mock.patch.object(HpSsaCliSetup, '_get_array_to_ld')
++    @mock.patch.object(HpSsaCliSetup, '_get_controllers')
++    @mock.patch('subprocess.check_output')
++    def test_get_pds_in_lds(self, exe, controllers, lds):
++        controllers.return_value = ['4']
++        lds.return_value = {'4': {'A': '1', 'B': '4'}}
++        pd_output = ['', 'Smart Array P410 in Slot 4', '', '   Array A', '',
++                     '      physicaldrive 2I:1:1 (port 2I:box 1:bay 1, SAS '
++                     'HDD, 300 GB, OK)',
++                     '      physicaldrive 2I:1:2 (port 2I:box 1:bay 1, SAS '
++                     'HDD, 300 GB, OK)',
++                     '      physicaldrive 2I:1:3 (port 2I:box 1:bay 1, SAS '
++                     'HDD, 300 GB, OK)', '', '   Array B', '',
++                     '      physicaldrive 2I:1:4 (port 2I:box 1:bay 1, SAS '
++                     'HDD, 300 GB, OK)']
++        exe.return_value = '\n'.join(pd_output)
++        expected_output = {'4': {'1': ['2I:1:1', '2I:1:2', '2I:1:3'],
++                                 '4': ['2I:1:4']}}
++        self.assertDictEqual(expected_output, self.hpraid._get_pds_in_lds())
++        exe.assert_called_once_with('ssacli ctrl slot=4 pd all show'.split())
++
++    @mock.patch.object(HpSsaCliSetup, '_get_array_to_ld')
++    @mock.patch.object(HpSsaCliSetup, '_get_controllers')
++    @mock.patch('subprocess.check_output')
++    def test_get_pds_in_lds_unassigned(self, exe, controllers, lds):
++        controllers.return_value = ['4']
++        lds.return_value = {'4': {'A': '1', 'B': '4'}}
++        pd_output = ['', 'Smart Array P410 in Slot 4', '', '   Array A', '',
++                     '      physicaldrive 2I:1:4 (port 2I:box 1:bay 1, SAS '
++                     'HDD, 300 GB, OK)',
++                     '', '   Unassigned', '',
++                     '      physicaldrive 2I:1:1 (port 2I:box 1:bay 1, SAS '
++                     'HDD, 300 GB, OK)',
++                     '      physicaldrive 2I:1:2 (port 2I:box 1:bay 1, SAS '
++                     'HDD, 300 GB, OK)',
++                     '      physicaldrive 2I:1:3 (port 2I:box 1:bay 1, SAS '
++                     'HDD, 300 GB, OK)']
++        exe.return_value = '\n'.join(pd_output)
++        expected_output = {'4': {'Unassigned': ['2I:1:1', '2I:1:2', '2I:1:3'],
++                                 '1': ['2I:1:4']}}
++        self.assertDictEqual(expected_output, self.hpraid._get_pds_in_lds())
++        exe.assert_called_once_with('ssacli ctrl slot=4 pd all show'.split())
++
++    @mock.patch.object(HpSsaCliSetup, '_delete_raid')
++    @mock.patch('subprocess.check_call')
++    def test_make_raid(self, exe, delete):
++        pds_in_lds = {'4': {'1': ['2I:1:1'],
++                            '4': ['2I:1:2'],
++                            '2': ['2I:1:3']}}
++        self.hpraid._make_raid(['2I:1:1', '2I:1:2', '2I:1:3'], 5, 64, '4',
++                               'raid5', pds_in_lds)
++        delete.assert_any_call('1', '4')
++        delete.assert_any_call('4', '4')
++        delete.assert_any_call('2', '4')
++        exe.assert_called_once_with('ssacli ctrl slot=4 create type=ld'
++                                    ' drives=2I:1:1,2I:1:2,2I:1:3'
++                                    ' raid=5 logicaldrivelabel=raid5'
++                                    ' stripsize=64'.split())
++
++    @mock.patch.object(HpSsaCliSetup, '_delete_raid')
++    @mock.patch('subprocess.check_call')
++    def test_make_raid_10(self, exe, delete):
++        pds_in_lds = {'4': {'1': ['2I:1:1'],
++                            '4': ['2I:1:2'],
++                            '7': ['2I:1:4'],
++                            '2': ['2I:1:3']}}
++        self.hpraid._make_raid(['2I:1:1', '2I:1:2', '2I:1:3', '2I:1:4'], 10,
++                               64, '4', 'raid10', pds_in_lds)
++        delete.assert_any_call('1', '4')
++        delete.assert_any_call('4', '4')
++        delete.assert_any_call('2', '4')
++        delete.assert_any_call('7', '4')
++        exe.assert_called_once_with('ssacli ctrl slot=4 create type=ld'
++                                    ' drives=2I:1:1,2I:1:2,2I:1:3,2I:1:4'
++                                    ' raid=1+0'
++                                    ' logicaldrivelabel=raid10'
++                                    ' stripsize=64'.split())
++
++    @mock.patch('subprocess.check_call')
++    def test_delete_raid(self, exe):
++        self.hpraid._delete_raid('1', '4')
++        exe.assert_called_once_with('ssacli ctrl slot=4 ld 1 delete'
++                                    ' forced'.split())
++
++    @mock.patch('subprocess.check_call')
++    def test_make_disk_jbod(self, exe):
++        self.hpraid._make_disks_jbod(['2I:1:1', '2I:1:2', '2I:1:3'], '4')
++        exe.assert_called_once_with('ssacli ctrl slot=4 create type=arrayr0'
++                                    ' drives=2I:1:1,2I:1:2,2I:1:3'.split())
++
++    # ssacli ctrl slot=4 ld all  show detail
++    @mock.patch.object(HpSsaCliSetup, '_get_pds_in_lds')
++    @mock.patch.object(HpSsaCliSetup, '_get_controllers')
++    @mock.patch('subprocess.check_output')
++    def test_get_lds_info(self, exe, controllers, pds):
++        pds.return_value = {'4': {'1': ['2I:1:1', '2I:1:2', '2I:1:3'],
++                                  '4': ['2I:1:4']}}
++        controllers.return_value = ['4']
++        with open('ironic_lib/tests/examples/'
++                  'ssacli_outputs/ld_show_detail.txt') as f:
++            exe.return_value = f.read()
++
++        expected_output = {'4': {'1': {'label': 'raid5', 'disk': '/dev/sda',
++                                       'raidtype': 5, 'disks_num': 3},
++                                 '4': {'label': None, 'disk': '/dev/sdd',
++                                       'raidtype': 0, 'disks_num': 1}}}
++        self.assertDictEqual(expected_output, self.hpraid._get_lds_info())
++        exe.assert_called_once_with('ssacli ctrl slot=4 ld all  show'
++                                    ' detail'.split())
++
++    @mock.patch.object(HpSsaCliSetup, '_get_controllers')
++    @mock.patch('subprocess.check_call')
++    def test_validate_env(self, exe, controllers):
++        controllers.return_value = ['4']
++        self.hpraid.validate_env()
++        exe.assert_called_once_with('which ssacli'.split())
++
++    @mock.patch.object(HpSsaCliSetup, '_get_controllers')
++    @mock.patch('subprocess.check_call')
++    def test_validate_env_fails(self, exe, controllers):
++        controllers.return_value = []
++        with self.assertRaises(exceptions.EnvError):
++            self.hpraid.validate_env()
++
++    @mock.patch('ironic_lib.system_installer.tools.validate_raid')
++    def test_validate_conf(self, raid):
++        self.hpraid.validate_conf()
++        raid.assert_called_once_with(1, ['disk0', 'disk1'])
++
++    @mock.patch('ironic_lib.system_installer.tools.validate_raid')
++    def test_validate_conf_fail(self, raid):
++        self.hpraid.conf['raid0']['stripe_size'] = 100
++        with self.assertRaises(exceptions.ConfError):
++            self.hpraid.validate_conf()
++        raid.assert_called_once_with(1, ['disk0', 'disk1'])
++
++    @mock.patch('ironic_lib.system_installer.tools.validate_raid')
++    def test_validate_conf_512kB(self, raid):
++        self.hpraid.conf['raid0']['stripe_size'] = 512
++        self.hpraid.validate_conf()
++        raid.assert_called_once_with(1, ['disk0', 'disk1'])
++
++    def test_get_src_names(self):
++        self.assertEqual(['disk0', 'disk1'], self.hpraid.get_src_names())
++
++    def test_get_dst_names(self):
++        self.assertEqual(['raid0'], self.hpraid.get_dst_names())
++
++    def test_get_disk_with_label(self):
++        lds = {'4': {'1': {'label': 'raid5', 'disk': '/dev/sda', 'raidtype': 5,
++                           'disks_num': 3},
++                     '4': {'label': None, 'disk': '/dev/sdd', 'raidtype': 0,
++                           'disks_num': 2}}}
++        raid = 'raid5'
++        controller = '4'
++
++        self.assertEqual('/dev/sda',
++                         self.hpraid._get_disk_with_label(lds, raid,
++                                                          controller))
++
++    def test_get_disk_with_label_fail(self):
++        lds = {'4': {'1': {'label': 'raid5', 'disk': '/dev/sda', 'raidtype': 5,
++                           'disks_num': 3},
++                     '4': {'label': None, 'disk': '/dev/sdd', 'raidtype': 0,
++                           'disks_num': 2}}}
++        raid = 'raid1'
++        controller = '4'
++
++        with self.assertRaises(exceptions.EnvError):
++            self.assertEqual('/dev/sda',
++                             self.hpraid._get_disk_with_label(lds, raid,
++                                                              controller))
++
++    @mock.patch.object(HpSsaCliSetup, '_get_pds_in_lds')
++    @mock.patch.object(HpSsaCliSetup, '_get_disk_with_label')
++    @mock.patch.object(HpSsaCliSetup, '_make_raid')
++    @mock.patch('ironic_lib.system_installer.tools.get_pds_for_raid')
++    @mock.patch('ironic_lib.system_installer.tools.get_controller_for_disks')
++    @mock.patch.object(partitionsetup.PartitionSetup,
++                       'get_not_partitioned_candidates')
++    @mock.patch.object(HpSsaCliSetup, '_get_lds_info')
++    def test_setup_disk(self, lds, part, controller, pds, make, disk,
++                        pds_in_lds):
++        lds.side_effect = [{'4': {'1': {'label': None, 'disk': '/dev/sda',
++                                        'raidtype': 0, 'disks_num': 1},
++                                  '4': {'label': None, 'disk': '/dev/sdb',
++                                        'raidtype': 0, 'disks_num': 1}}},
++                           {'4': {'1': {'label': 'raid0', 'disk': '/dev/sda',
++                                        'raidtype': 1, 'disks_num': 2}}}]
++        part.return_value = {"disk0": "/dev/sda", "disk1": "/dev/sdb"}
++        controller.return_value = '4'
++        pds_in_lds_dict = {'0': {'1': ['2I:1:1'],
++                                 '4': ['2I:1:2']}}
++        pds_in_lds.return_value = pds_in_lds_dict
++        pds.return_value = ['2I:1:1', '2I:1:2']
++        disk.return_value = '/dev/sda'
++        devices = {'raid0': '/dev/sda',
++                   'disk0': '/dev/sda',
++                   'disk1': '/dev/sdb'}
++        self.assertDictEqual(devices, self.hpraid.setup_disks({}))
++        make.assert_called_once_with(['2I:1:1', '2I:1:2'], 1, 64, '4', 'raid0',
++                                     pds_in_lds_dict)
++
++    @mock.patch.object(HpSsaCliSetup, '_get_pds_in_lds')
++    @mock.patch.object(HpSsaCliSetup, '_get_disk_with_label')
++    @mock.patch.object(HpSsaCliSetup, '_make_raid')
++    @mock.patch('ironic_lib.system_installer.tools.get_pds_for_raid')
++    @mock.patch('ironic_lib.system_installer.tools.get_controller_for_disks')
++    @mock.patch.object(partitionsetup.PartitionSetup,
++                       'get_not_partitioned_candidates')
++    @mock.patch.object(HpSsaCliSetup, '_get_lds_info')
++    def test_setup_disk_raid_in_dev(self, lds, part, controller, pds, make,
++                                    disk, pds_in_lds):
++        with open('ironic_lib/tests/examples/megacli_2_raids.yml') as f:
++            conf = yaml.load(f)
++        lds.side_effect = [{'4': {'1': {'label': None, 'disk': '/dev/sda',
++                                        'raidtype': 0, 'disks_num': 1},
++                                  '4': {'label': None, 'disk': '/dev/sdc',
++                                        'raidtype': 0, 'disks_num': 1},
++                                  '2': {'label': None, 'disk': '/dev/sdd',
++                                        'raidtype': 0, 'disks_num': 1},
++                                  '3': {'label': None, 'disk': '/dev/sde',
++                                        'raidtype': 0, 'disks_num': 1},
++                                  '6': {'label': 'raid1', 'disk': '/dev/sdb',
++                                        'raidtype': 1, 'disks_num': 2}}},
++                           {'4': {'1': {'label': 'raid0', 'disk': '/dev/sda',
++                                        'raidtype': 1, 'disks_num': 2},
++                                  '2': {'label': None, 'disk': '/dev/sdd',
++                                        'raidtype': 0, 'disks_num': 1},
++                                  '4': {'label': None, 'disk': '/dev/sdc',
++                                        'raidtype': 0, 'disks_num': 1},
++                                  '6': {'label': 'raid1', 'disk': '/dev/sdb',
++                                        'raidtype': 1, 'disks_num': 2}}}]
++
++        hpraid = HpSsaCliSetup(conf['disk_config'])
++        controller.return_value = '4'
++        pds_in_lds_dict = {'0': {'1': ['2I:1:1'],
++                                 '4': ['2I:1:3'],
++                                 '2': ['2I:1:5'],
++                                 '3': ['2I:1:2'],
++                                 '4': ['2I:1:7', '2I:1:9']}}
++        pds_in_lds.return_value = pds_in_lds_dict
++        disks = {"disk0": "/dev/sda", "disk1": "/dev/sde",
++                 'disk2': '/dev/sdc', 'disk3': '/dev/sdd'}
++        part.return_value = disks
++        devices = {'raid0': '/dev/sda', 'raid1': '/dev/sdb',
++                   'disk0': '/dev/sda', 'disk1': '/dev/sde',
++                   'disk2': '/dev/sdc', 'disk3': '/dev/sdd'}
++        disk.return_value = '/dev/sda'
++        pds.return_value = ['2I:1:1', '2I:1:2']
++        self.assertEqual(hpraid.setup_disks({'raid1': '/dev/sdb'}), devices)
++        make.assert_called_once_with(['2I:1:1', '2I:1:2'], 1, 64, '4', 'raid0',
++                                     pds_in_lds_dict)
++
++    @mock.patch.object(HpSsaCliSetup, '_get_pds_in_lds')
++    @mock.patch.object(HpSsaCliSetup, '_get_pd_in_controllers')
++    @mock.patch.object(HpSsaCliSetup, '_get_lds_info')
++    @mock.patch.object(HpSsaCliSetup, '_make_disks_jbod')
++    @mock.patch.object(HpSsaCliSetup, '_delete_raid')
++    def test_clean_disks(self, delete, jbod, lds, pds_in_ctrl, pds_in_lds):
++        lds.return_value = {'4': {'1': {'label': 'raid0', 'disk': '/dev/sda',
++                                        'raidtype': 0, 'disks_num': 3},
++                                  '4': {'label': 'raid1', 'disk': '/dev/sdb',
++                                        'raidtype': 1, 'disks_num': 2}}}
++        pds_in_ctrl.return_value = {'4': ['2I:1:1', '2I:1:2', '2I:1:3',
++                                          '2I:1:4', '2I:1:5']}
++        pds_in_lds.return_value = {'4': {'1': ['2I:1:1', '2I:1:2', '2I:1:3'],
++                                         '4': ['2I:1:4', '2I:1:5']}}
++        self.hpraid.clean_disks({})
++        delete.assert_any_call('1', '4')
++        delete.assert_any_call('4', '4')
++        jbod.assert_any_call(['2I:1:1', '2I:1:2', '2I:1:3'], '4')
++        jbod.assert_any_call(['2I:1:4', '2I:1:5'], '4')
++
++    @mock.patch.object(HpSsaCliSetup, '_get_pds_in_lds')
++    @mock.patch.object(HpSsaCliSetup, '_get_pd_in_controllers')
++    @mock.patch.object(HpSsaCliSetup, '_get_lds_info')
++    @mock.patch.object(HpSsaCliSetup, '_make_disks_jbod')
++    @mock.patch.object(HpSsaCliSetup, '_delete_raid')
++    def test_clean_disks_preserve(self, delete, jbod, lds, pds_in_ctrl,
++                                  pds_in_lds):
++        lds.return_value = {'4': {'1': {'label': 'raid0', 'disk': '/dev/sda',
++                                        'raidtype': 0, 'disks_num': 3},
++                                  '4': {'label': 'raid1', 'disk': '/dev/sdb',
++                                        'raidtype': 1, 'disks_num': 2}}}
++        pds_in_ctrl.return_value = {'4': ['2I:1:1', '2I:1:2', '2I:1:3',
++                                          '2I:1:4', '2I:1:5']}
++        pds_in_lds.return_value = {'4': {'1': ['2I:1:1', '2I:1:2', '2I:1:3'],
++                                         '4': ['2I:1:4', '2I:1:5']}}
++        preserved = {'raid0': '/dev/sda'}
++        self.hpraid.clean_disks(preserved)
++        delete.assert_called_once_with('4', '4')
++        jbod.assert_called_once_with(['2I:1:4', '2I:1:5'], '4')
++
++    @mock.patch.object(HpSsaCliSetup, '_get_pds_in_lds')
++    @mock.patch.object(HpSsaCliSetup, '_get_pd_in_controllers')
++    @mock.patch.object(HpSsaCliSetup, '_get_lds_info')
++    @mock.patch.object(HpSsaCliSetup, '_make_disks_jbod')
++    @mock.patch.object(HpSsaCliSetup, '_delete_raid')
++    def test_clean_disks_preserve_omit_jbod(self, delete, jbod, lds,
++                                            pds_in_ctrl, pds_in_lds):
++        lds.return_value = {'4': {'1': {'label': 'raid0', 'disk': '/dev/sda',
++                                        'raidtype': 0, 'disks_num': 1},
++                                  '4': {'label': 'raid1', 'disk': '/dev/sdb',
++                                        'raidtype': 1, 'disks_num': 2}}}
++        pds_in_ctrl.return_value = {'4': ['2I:1:1', '2I:1:2', '2I:1:3']}
++        pds_in_lds.return_value = {'4': {'1': ['2I:1:1'],
++                                         '4': ['2I:1:2', '2I:1:3']}}
++        self.hpraid.clean_disks({})
++        delete.assert_called_once_with('4', '4')
++        jbod.assert_called_once_with(['2I:1:2', '2I:1:3'], '4')
++
++    @mock.patch.object(HpSsaCliSetup, '_get_pds_in_lds')
++    @mock.patch.object(HpSsaCliSetup, '_get_pd_in_controllers')
++    @mock.patch.object(HpSsaCliSetup, '_get_lds_info')
++    @mock.patch.object(HpSsaCliSetup, '_make_disks_jbod')
++    @mock.patch.object(HpSsaCliSetup, '_delete_raid')
++    def test_clean_disks_preserve_unassigned(self, delete, jbod, lds,
++                                             pds_in_ctrl, pds_in_lds):
++        lds.return_value = {'4': {}}
++        pds_in_ctrl.return_value = {'4': ['2I:1:1', '2I:1:2', '2I:1:3']}
++        pds_in_lds.return_value = {'4': {'Unassigned': ['2I:1:1', '2I:1:2',
++                                                        '2I:1:3']}}
++        preserved = {}
++        self.hpraid.clean_disks(preserved)
++        delete.assert_not_called()
++        jbod.assert_called_once_with(['2I:1:1', '2I:1:2', '2I:1:3'], '4')
++
++    @mock.patch('subprocess.check_call')
++    def test_is_hpraid_controller(self, exe):
++        self.assertTrue(self.hpraid.is_hpraid_controller())
++
++    @mock.patch('subprocess.check_call')
++    def test_is_hpraid_controller_fails_which(self, exe):
++        exe.side_effect = [subprocess.CalledProcessError("1", "ssacli"), '']
++        self.assertFalse(self.hpraid.is_hpraid_controller())
++
++    @mock.patch('subprocess.check_call')
++    def test_is_hpraid_controller_fails_ctrl(self, exe):
++        exe.side_effect = ['', subprocess.CalledProcessError("1", "ssacli")]
++        self.assertFalse(self.hpraid.is_hpraid_controller())
+-- 
+2.16.2
+
