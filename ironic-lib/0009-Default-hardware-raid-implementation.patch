@@ -1,0 +1,175 @@
+From 53a416bdad103f4bede1d9fe52a29db178578e8a Mon Sep 17 00:00:00 2001
+From: "Grzegorz Grasza (xek)" <grzegorz.grasza@intel.com>
+Date: Fri, 9 Feb 2018 13:57:02 +0100
+Subject: [PATCH 09/11] Default hardware raid implementation
+
+This overwrite the hardware RAID configuration so that all block devices
+are converted to RAIDs.
+---
+ ironic_lib/system_installer/__init__.py   |  35 ++++++++++
+ ironic_lib/tests/test_system_installer.py | 102 ++++++++++++++++++++++++++++++
+ 2 files changed, 137 insertions(+)
+
+diff --git a/ironic_lib/system_installer/__init__.py b/ironic_lib/system_installer/__init__.py
+index 4dbf38c..39d67e0 100644
+--- a/ironic_lib/system_installer/__init__.py
++++ b/ironic_lib/system_installer/__init__.py
+@@ -179,3 +179,38 @@ class SystemInstaller(object):
+             devices = self.make_lvm(devices)
+         devices = self.format_partitions(devices)
+         return self.install_system(devices, image_path)
++
++    def reconfigure_default_hwraid(self, raid_level):
++        """Overwrite the configuration so that all block devices are RAIDs
++
++        This method takes a raid_level and configures raids with the minimal
++        number of disks. The number of configured RAIDs is equal to the number
++        of block devices specified in the config. Ordering is not important.
++
++        This only make raids for disks which don't have a raid configuration.
++        """
++        raid_map = {0: 1, 1: 2, 5: 3, 6: 4, 10: 4}
++        if raid_level not in raid_map:
++            raise ConfError('Wrong default raid_level specified')
++        disk_number = raid_map[raid_level]
++        block_conf = self.conf[PartitionSetup.conf_key]
++        if MegaCliSetup.conf_key in self.conf:
++            raid_conf = self.conf[MegaCliSetup.conf_key]
++            megacli_setup = MegaCliSetup(self.conf)
++            hwraid_devices = set(megacli_setup.get_src_names()
++                                 + megacli_setup.get_dst_names())
++        else:
++            self.conf[MegaCliSetup.conf_key] = raid_conf = {}
++            hwraid_devices = set()
++        for i, (label, partitions) in enumerate(list(block_conf.items())):
++            if label in hwraid_devices:
++                continue  # skip already configured devices
++            block_conf[label] = partitions
++            if 'candidates' in partitions:
++                del partitions['candidates']
++            disk_labels = ['defaulthwraid-{}-{}'.format(i, l)
++                           for l in range(disk_number)]
++            for raid_candidate_label in disk_labels:
++                block_conf[raid_candidate_label] = {'candidates': 'any'}
++            raid_conf[label] = {'raidtype': raid_level,
++                                'partitions': disk_labels}
+diff --git a/ironic_lib/tests/test_system_installer.py b/ironic_lib/tests/test_system_installer.py
+index ac95b7d..93a01d4 100644
+--- a/ironic_lib/tests/test_system_installer.py
++++ b/ironic_lib/tests/test_system_installer.py
+@@ -13,6 +13,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++from collections import OrderedDict
+ import json
+ import unittest
+ 
+@@ -974,3 +975,104 @@ class TestSystemInstaller(unittest.TestCase):
+         self.assertFalse(ml.called)
+         fp.assert_called_once()
+         ins.assert_called_once()
++
++    def test_reconfigure_default_raid(self):
++        self.maxDiff = None
++        cfg_dict = {
++            'disk_config': {
++                'blockdev': OrderedDict([
++                    ('disk0', {
++                        'candidates': 'any',
++                        'partitions': {
++                            'd0p0': {}
++                        }
++                    }),
++                    ('disk1', {
++                        'candidates': 'any',
++                        'partitions': {
++                            'd1p0': {}
++                        }
++                    })]),
++                'filesystems': {
++                    'd1p0': {'mountpoint': '/'}
++                },
++            }
++        }
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        sysinst.reconfigure_default_hwraid(5)
++        self.assertDictEqual(
++            json.loads(json.dumps(sysinst.conf)),
++            {u'filesystems': {u'd1p0': {u'mountpoint': u'/'}},
++             u'blockdev': {
++                u'disk0': {u'partitions': {u'd0p0': {}}},
++                u'disk1': {u'partitions': {u'd1p0': {}}},
++                u'defaulthwraid-0-0': {u'candidates': u'any'},
++                u'defaulthwraid-0-1': {u'candidates': u'any'},
++                u'defaulthwraid-0-2': {u'candidates': u'any'},
++                u'defaulthwraid-1-0': {u'candidates': u'any'},
++                u'defaulthwraid-1-1': {u'candidates': u'any'},
++                u'defaulthwraid-1-2': {u'candidates': u'any'}},
++             u'hwraid': {
++                 u'disk0': {u'partitions': [u'defaulthwraid-0-0',
++                                            u'defaulthwraid-0-1',
++                                            u'defaulthwraid-0-2'],
++                            u'raidtype': 5},
++                 u'disk1': {u'partitions': [u'defaulthwraid-1-0',
++                                            u'defaulthwraid-1-1',
++                                            u'defaulthwraid-1-2'],
++                            u'raidtype': 5}}})
++
++    def test_reconfigure_default_raid_partial(self):
++        self.maxDiff = None
++        cfg_dict = {
++            'disk_config': {
++                'blockdev': OrderedDict([
++                    ('disk0', {
++                        'partitions': {
++                            'd0p0': {}
++                        }
++                    }),
++                    (u'hwraid-0-0', {u'candidates': u'any'}),
++                    (u'hwraid-0-1', {u'candidates': u'any'}),
++                    (u'hwraid-0-2', {u'candidates': u'any'}),
++                    ('disk1', {
++                        'candidates': 'any',
++                        'partitions': {
++                            'd1p0': {}
++                        }
++                    })]),
++                'filesystems': {
++                    'd0p0': {'mountpoint': '/home'},
++                    'd1p0': {'mountpoint': '/'}
++                },
++                u'hwraid': {
++                    u'disk0': {u'partitions': [u'hwraid-0-0',
++                                               u'hwraid-0-1',
++                                               u'hwraid-0-2'],
++                               u'raidtype': 5}}
++            }
++        }
++        sysinst = si.SystemInstaller(json.dumps(cfg_dict))
++        sysinst.reconfigure_default_hwraid(5)
++        self.assertDictEqual(
++            json.loads(json.dumps(sysinst.conf)),
++            {u'filesystems': {u'd1p0': {u'mountpoint': u'/'},
++                              u'd0p0': {u'mountpoint': u'/home'}},
++             u'blockdev': {
++                u'disk0': {u'partitions': {u'd0p0': {}}},
++                u'disk1': {u'partitions': {u'd1p0': {}}},
++                u'hwraid-0-0': {u'candidates': u'any'},
++                u'hwraid-0-1': {u'candidates': u'any'},
++                u'hwraid-0-2': {u'candidates': u'any'},
++                u'defaulthwraid-4-0': {u'candidates': u'any'},
++                u'defaulthwraid-4-1': {u'candidates': u'any'},
++                u'defaulthwraid-4-2': {u'candidates': u'any'}},
++             u'hwraid': {
++                 u'disk0': {u'partitions': [u'hwraid-0-0',
++                                            u'hwraid-0-1',
++                                            u'hwraid-0-2'],
++                            u'raidtype': 5},
++                 u'disk1': {u'partitions': [u'defaulthwraid-4-0',
++                                            u'defaulthwraid-4-1',
++                                            u'defaulthwraid-4-2'],
++                            u'raidtype': 5}}})
+-- 
+2.14.1
+

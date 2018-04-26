@@ -1,0 +1,32 @@
+From bcf84287fe6eeb3cdaba07d39700a3b1881e09dd Mon Sep 17 00:00:00 2001
+From: "Grzegorz Grasza (xek)" <grzegorz.grasza@intel.com>
+Date: Fri, 9 Feb 2018 14:17:56 +0100
+Subject: [PATCH 3/3] Add default_raid support
+
+---
+ ironic_python_agent/extensions/standby.py | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/ironic_python_agent/extensions/standby.py b/ironic_python_agent/extensions/standby.py
+index 88662fd..219b291 100644
+--- a/ironic_python_agent/extensions/standby.py
++++ b/ironic_python_agent/extensions/standby.py
+@@ -455,12 +455,15 @@ class StandbyExtension(base.BaseAgentExtension):
+ 
+         if self.agent and self.agent.node['instance_info'].get('ybiip'):
+             disk_config = self.agent.node['instance_info'].get('ybiip')
++            default_raid = self.agent.node['properties'].get('default_raid')
+             LOG.debug('Found ybiip disk_config in instance_info,'
+                       ' running SystemInstaller...')
+             if image_info.get('disk_format') != 'qcow2':
+                 errors.InvalidContentError('qcow2 is the only image format'
+                                            ' supported by SystemInstaller')
+             installer = system_installer.SystemInstaller(disk_config)
++            if default_raid is not None:
++                system_installer.reconfigure_default_hwraid(default_raid)
+             _download_image(image_info)
+             boot_device = installer.install(_image_location(image_info))
+             if configdrive and boot_device:
+-- 
+2.14.1
+
