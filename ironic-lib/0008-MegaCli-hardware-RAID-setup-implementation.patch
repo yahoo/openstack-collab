@@ -1,0 +1,4334 @@
+From ba10632cd97376f2470951e6757bca840e8bf61c Mon Sep 17 00:00:00 2001
+From: "Grzegorz Grasza (xek)" <grzegorz.grasza@intel.com>
+Date: Fri, 26 Jan 2018 15:36:53 +0100
+Subject: [PATCH 08/11] MegaCli hardware RAID setup implementation
+
+Co-Authored-By: Piotr Prokop <piotr.prokop@intel.com>
+Co-Authored-By: Grzegorz Grasza <grzegorz.grasza@intel.com>
+---
+ ironic_lib/system_installer/megaclisetup.py        |  744 +++++++++++++
+ ironic_lib/system_installer/tools.py               |   80 ++
+ ironic_lib/tests/examples/example_efi.yaml         |    3 +-
+ ironic_lib/tests/examples/megacli.yml              |   12 +
+ ironic_lib/tests/examples/megacli_2_raids.yml      |   22 +
+ .../examples/megacli_cmd_outputs/lspci_output.txt  |    7 +
+ .../megacli_cmd_outputs/megacli_adinfo_output.txt  |  303 ++++++
+ .../megacli_cmd_outputs/megacli_ld_output.txt      |   33 +
+ .../megacli_ldinfo_2lds_output.txt                 |   65 ++
+ .../megacli_cmd_outputs/megacli_ldpdinfo.txt       |  292 +++++
+ .../megacli_ldpdinfo_raid10.txt                    |  250 +++++
+ .../megacli_cmd_outputs/megacli_output.txt         |  187 ++++
+ .../megacli_pdinfo_jbod_output.txt                 |   50 +
+ .../megacli_pdinfo_unconfigured_output.txt         |   50 +
+ .../megacli_cmd_outputs/megacli_real_output.txt    | 1142 ++++++++++++++++++++
+ .../megacli_cmd_outputs/udevadm_output.txt         |   32 +
+ ironic_lib/tests/test_megacli.py                   |  716 ++++++++++++
+ ironic_lib/tests/test_tools.py                     |  147 ++-
+ requirements.txt                                   |    1 +
+ 19 files changed, 4133 insertions(+), 3 deletions(-)
+ create mode 100644 ironic_lib/tests/examples/megacli.yml
+ create mode 100644 ironic_lib/tests/examples/megacli_2_raids.yml
+ create mode 100644 ironic_lib/tests/examples/megacli_cmd_outputs/lspci_output.txt
+ create mode 100644 ironic_lib/tests/examples/megacli_cmd_outputs/megacli_adinfo_output.txt
+ create mode 100644 ironic_lib/tests/examples/megacli_cmd_outputs/megacli_ld_output.txt
+ create mode 100644 ironic_lib/tests/examples/megacli_cmd_outputs/megacli_ldinfo_2lds_output.txt
+ create mode 100644 ironic_lib/tests/examples/megacli_cmd_outputs/megacli_ldpdinfo.txt
+ create mode 100644 ironic_lib/tests/examples/megacli_cmd_outputs/megacli_ldpdinfo_raid10.txt
+ create mode 100644 ironic_lib/tests/examples/megacli_cmd_outputs/megacli_output.txt
+ create mode 100644 ironic_lib/tests/examples/megacli_cmd_outputs/megacli_pdinfo_jbod_output.txt
+ create mode 100644 ironic_lib/tests/examples/megacli_cmd_outputs/megacli_pdinfo_unconfigured_output.txt
+ create mode 100644 ironic_lib/tests/examples/megacli_cmd_outputs/megacli_real_output.txt
+ create mode 100644 ironic_lib/tests/examples/megacli_cmd_outputs/udevadm_output.txt
+ create mode 100644 ironic_lib/tests/test_megacli.py
+
+diff --git a/ironic_lib/system_installer/megaclisetup.py b/ironic_lib/system_installer/megaclisetup.py
+index 76cae96..274b678 100644
+--- a/ironic_lib/system_installer/megaclisetup.py
++++ b/ironic_lib/system_installer/megaclisetup.py
+@@ -13,14 +13,758 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++try:
++    from functools import lru_cache
++except ImportError:
++    from backports.functools_lru_cache import lru_cache
++import json
++import os.path
++import re
++import retrying
++import subprocess
++
++from oslo_log import log
++
+ from ironic_lib.system_installer.base import Setup
++from ironic_lib.system_installer import exceptions
++from ironic_lib.system_installer import partitionsetup
++from ironic_lib.system_installer import tools
++
++LOG = log.getLogger()
+ 
+ 
+ class MegaCliSetup(Setup):
+     """Hardware RAID setup implementation"""
+ 
++    default_stripe_size = 512
+     conf_key = 'hwraid'
++    default_megacli_path = '/opt/MegaRAID/MegaCli/MegaCli64'
++    fw_states = {'Unconfigured(good), Spun Up': 'good', 'JBOD': 'jbod',
++                 'online': 'Online, Spun Up'}
++
++    def __init__(self, conf):
++        super(MegaCliSetup, self).__init__(conf)
++        self.conf_part = conf
++
++    @classmethod
++    @lru_cache(maxsize=None)
++    def _megacli_path_cached(self):
++        """Find MegaCli64 binary"""
++        try:
++            subprocess.check_call(['which', 'MegaCli64'])
++        except subprocess.CalledProcessError:
++            if os.path.isfile(self.default_megacli_path):
++                return self.default_megacli_path
++
++            else:
++                raise exceptions.EnvError('No MegaCli64 binary')
++        return 'MegaCli64'
++
++    @tools.classproperty
++    @classmethod
++    def _megacli_path(self):
++        return self._megacli_path_cached()
++
++    def _get_block_device_to_wwn(self):
++        """Return a dict with block device to wwn mapping"""
++        lsblk = json.loads(subprocess.check_output(['lsblk', '-o', 'NAME,WWN',
++                                                    '-J', '-d']))
++        bdevice_wwn = {}
++        for bdevice in lsblk['blockdevices']:
++            if bdevice.get('wwn'):
++                bdevice_wwn['/dev/' + bdevice['name']] = bdevice['wwn'][2:]
++
++        return bdevice_wwn
++
++    @classmethod
++    def _get_not_jbod_disks(self):
++        """Return disks which are not set to JBOD -> in our case single disk
++
++        RAID0
++        """
++        output = {}
++        drives = subprocess.check_output([self._megacli_path,
++                                          '-PDList',
++                                          '-aAll'])
++        enclosure = fw = slot = adapter = None
++
++        for line in drives.split('\n'):
++
++            re_adapter = re.match('Adapter\s#(\d+)', line)
++            if re_adapter:
++                adapter = re_adapter.groups()[0]
++                output[adapter] = []
++
++            if not adapter:
++                continue
++
++            re_enclosure = re.match('Enclosure\sDevice\sID:\s(\d+)', line)
++            if re_enclosure:
++                enclosure = re_enclosure.groups()[0]
++                fw = slot = None
++                continue
++
++            re_slot = re.match('Slot\sNumber:\s(\d+)', line)
++            if re_slot:
++                slot = re_slot.groups()[0]
++                continue
++
++            if 'Firmware state:' in line:
++                fw = line.split(':')[1].strip()
++                if not all([enclosure, slot, fw]):
++                    raise exceptions.EnvError(
++                        "Slot: {slot}, Enclosure: {enclosure},"
++                        "or Firmware: {fw} not found".format(
++                            slot=slot, enclosure=enclosure, fw=fw))
++
++            if (all([enclosure, slot, fw]) and
++                    fw not in [self.fw_states['online']]):
++
++                output[str(adapter)].append("{}:{}".format(enclosure, slot))
++                enclosure = None
++
++        return output
++
++    def _get_disks_to_wwn(self):
++        """Return dict with a disk seen in Linux
++
++        like: sda, sdb etc. to WWN mapping
++        """
++        output = {}
++        drives = subprocess.check_output([self._megacli_path,
++                                          '-PDList',
++                                          '-aAll'])
++        enclosure = wwn = slot = adapter = None
++
++        for line in drives.split('\n'):
++
++            re_adapter = re.match('Adapter\s#(\d+)', line)
++            if re_adapter:
++                adapter = re_adapter.groups()[0]
++                output[adapter] = {}
++
++            if not adapter:
++                continue
++
++            re_enclosure = re.match('Enclosure\sDevice\sID:\s(\d+)', line)
++            if re_enclosure:
++                enclosure = re_enclosure.groups()[0]
++                wwn = slot = None
++
++            re_slot = re.match('Slot\sNumber:\s(\d+)', line)
++            if re_slot:
++                slot = re_slot.groups()[0]
++
++            re_wwn = re.match('WWN:\s([a-zA-Z0-9]+)', line)
++            if re_wwn:
++                wwn = re_wwn.groups()[0].lower()
++                if not all([enclosure, slot, wwn]):
++                    raise exceptions.EnvError(
++                        "Slot: {slot}, Enclosure: {enclosure},"
++                        "or WWN: {wwn} not found".format(
++                            slot=slot, enclosure=enclosure, wwn=wwn))
++
++            if all([enclosure, slot, wwn]):
++                output[adapter]["{}:{}".format(enclosure, slot)] = wwn
++
++        return output
++
++    def _map_blk_to_enc(self):
++        """Return a dict with a disk seen in Linux
++
++        like: sda, sdb etc. to Enclosure:Slot mapping
++        """
++        lsblk = self._get_block_device_to_wwn()
++        megacli = self._get_disks_to_wwn()
++        mapping = {}
++        for adapter_id, enc in megacli.items():
++            for disk, wwn in lsblk.items():
++                for enc_id, enc_wwn in enc.items():
++                    if wwn == enc_wwn:
++                        mapping[disk] = {'adapter': adapter_id, 'enc': enc_id}
++
++        return mapping
++
++    @classmethod
++    def _get_bus_from_lspci(self, line):
++        """Get bus number from lspci output"""
++        return line.split()[0]
++
++    @classmethod
++    def _make_disks_good(self, encs, adapter):
++        """Set Firmware state of disk to Unconfigured(Good)"""
++        for enc in encs:
++            if self._get_firmware_state(enc, adapter) == "good":
++                LOG.debug('Firmware state of enc {} is already Unconfigured'
++                          'Good, doing nothing'.format(enc))
++                continue
++
++            LOG.debug("Setting Firmware state of enc: {} in adapter {} to"
++                      "Unconfigured Good".format(encs, adapter))
++            subprocess.check_call([self._megacli_path, '-PDMakeGood',
++                                   '-PhysDrv', '[{}]'.format(enc), '-Force',
++                                   '-a{}'.format(adapter)])
++
++    @classmethod
++    def _make_disks_jbod(self, encs, stripe_size, adapter, pds_in_lds):
++        """Set disk to JBOD"""
++        adapter_to_pci_bus = self._get_adapters_to_pci_bus()
++        hctl = adapter_to_pci_bus[adapter]
++        for enc in encs:
++            LOG.debug("Making JBOD from enc: {} in adapter: {}"
++                      .format(enc, adapter))
++            vd_target = self._make_raid(0, stripe_size, [enc], adapter,
++                                        pds_in_lds)
++            # make sure created JBOD(single drive RAID0) is seen in Linux
++            self._hctl_to_disk(hctl, vd_target)
++
++    # give time to kernel to catch up new block devices
++    @classmethod
++    @retrying.retry(
++        retry_on_exception=(lambda e: isinstance(e, exceptions.EnvError)),
++        stop_max_attempt_number=5,
++        wait_fixed=1000)
++    def _make_raid(self, raidtype, stripe_size, encs, adapter, pds_in_lds):
++        """Create specified raid on a given controller"""
++        formatted_adapter = '-a{}'.format(adapter)
++
++        # each disk is a single disk RAID0 so delete the RAID to be able to
++        # create a new one
++        for pd in encs:
++            # retrieve information about which vd_target is JBOD
++            ld = [ld for ld in pds_in_lds[adapter] if pd in
++                  pds_in_lds[adapter].get(ld)]
++
++            if len(ld) == 1:
++                # we assume all disks are JBOD(single disk RAID0)
++                # so  we delete them to be able to made a
++                # new RAID from those disks
++                self._delete_raid(ld[0], adapter)
++
++        # ./MegaCli64 -CfgLDAdd r0[32:9,32:10] a0
++        if raidtype in [0, 1, 5, 6]:
++            disks = '[{}]'.format(",".join(encs))
++            LOG.debug("Making RAID {} out of encs: {} in adapter"
++                      "{}".format(raidtype, disks, adapter))
++            out = subprocess.check_output([self._megacli_path,
++                                           '-CfgLDAdd',
++                                           '-R{}'.format(raidtype),
++                                           disks,
++                                           '-strpsz{}'.format(stripe_size),
++                                           formatted_adapter])
++        # ./MegaCli64 -CfgSpanAdd R10 Array0 [32:18,32:19] Array1[32:20,32:21]
++        # -a0
++        elif raidtype == 10:
++            LOG.debug("Making RAID10 from encs: {} in adapter: {}"
++                      .format(encs, adapter))
++
++            cmd = [self._megacli_path, '-CfgSpanAdd', 'R10']
++            index = 0
++            for i in range(0, len(encs), 2):
++                disks = '[{}]'.format(",".join([encs[i], encs[i + 1]]))
++                cmd.append('Array{}'.format(index))
++                cmd.append(disks)
++                index += 1
++
++            # add stripe_size option
++            cmd.append('-strpsz{}'.format(stripe_size))
++            # add adapter option
++            cmd.append(formatted_adapter)
++            out = subprocess.check_output(cmd)
++        else:
++            raise exceptions.ConfError(
++                "Unknown RAID type: {}".format(raidtype))
++
++        # example output:
++        # Adapter 0: Created VD 2
++        for line in out.split('\n'):
++            re_vd = re.match('Adapter\s\d+:\sCreated\sVD\s(\d+)', line)
++            if re_vd:
++                return re_vd.groups()[0]
++
++        # TODO(pprokop): should we initialize Array and let it work in the
++        # background?
++
++        raise exceptions.EnvError("Couldn't retrieve created VD id")
++
++    # MegaCli64 -LDInfo -L0 -a0
++    def _get_target_of_vd(self, vd, adapter):
++        """Get ISCSI target for Virtual Drive"""
++        out = subprocess.check_output([self._megacli_path, '-LDInfo',
++                                       '-L{}'.format(vd),
++                                       '-a{}'.format(adapter)])
++
++        # example line:
++        # Virtual Drive: 0 (Target Id: 0)
++        for line in out.split('\n'):
++            re_tar = re.match('Virtual\sDrive:\s\d+\s\(Target\sId:\s(\d+)\)',
++                              line)
++            if re_tar:
++                return re_tar.groups()[0]
++
++        raise exceptions.EnvError('Couldnt get target for VD: {} in adapter:'
++                                  '{}'.format(vd, adapter))
++
++    # MegaCli64 -Pdinfo -physdrv[32:22] -a0
++    @classmethod
++    def _get_firmware_state(self, enc, adapter):
++        """Get Firmware State for given disk"""
++        out = subprocess.check_output([self._megacli_path, '-PDInfo',
++                                       '-PhysDrv', '[{}]'.format(enc),
++                                       '-a{}'.format(adapter)])
++
++        for line in out.split('\n'):
++            if 'Firmware state:' in line:
++                return self.fw_states[line.split(':')[1].strip()]
++
++        raise exceptions.EnvError(
++            'Couldnt get Firmware state for enc: {} in adapter:'
++            '{}'.format(enc, adapter))
++
++    def validate_conf(self):
++        """Validate the contents of self.conf.
++
++        Raises: ironic_lib.system_installer.exceptions.ConfError.
++        """
++        for raid in self.conf.keys():
++            raidtype = self.conf[raid]['raidtype']
++            # logical disks to make RAID from
++            partitions = self.conf[raid]['partitions']
++            if not tools.validate_raid(raidtype, partitions):
++                raise exceptions.ConfError('Raid {} cannot be created,'
++                                           'too few disks specified or its '
++                                           'number is not'
++                                           ' even'.format(raidtype))
++
++            stripe_size = int(self.conf[raid].get('stripe_size', 0))
++            if stripe_size and stripe_size not in [64, 128, 256, 512, 1024]:
++                raise exceptions.ConfError('Unsupported stripe_size:'
++                                           ' {}'.format(stripe_size))
++
++    def validate_env(self):
++        """Validate the environment: check available commands and devices.
++
++        Raises: ironic_lib.system_installer.exceptions.EnvError.
++        """
++        # run this function for the first time to cache its result and
++        # validate if there is MegaCli binary on the host
++        self._megacli_path
++        if self._get_adapters_count() <= 0:
++            raise exceptions.EnvError('Couldnt find MegaRAID controller')
++
++    def get_src_names(self):
++        """Return a list of source device/filesystem names."""
++        src = []
++        for raid in self.conf.keys():
++            src.extend(self.conf[raid]['partitions'])
++        return src
++
++    def get_dst_names(self):
++        """Return a list of device/filesystem names that will be created."""
++        return [raid for raid in self.conf.keys()]
++
++    def _get_adapter(self, mapping, partitions, devices):
++        """Return adapter for given disks"""
++        adapter = None
++        for partition in partitions:
++            disk = devices[partition]
++            if adapter != mapping[disk]['adapter'] and adapter is not None:
++                raise exceptions.EnvError(
++                    'Disks chosen to become RAID are not on the same adapter')
++
++            adapter = mapping[disk]['adapter']
++        return adapter
++
++    def _get_encs_from_partitions(self, mapping, partitions, devices):
++        """Return list of Enclosure:Slot from given disks"""
++        encs = []
++        for partition in partitions:
++            # get physical drive
++            disk = devices[partition]
++            # retireve enc
++            encs.append(mapping[disk]['enc'])
++        return encs
++
++    @classmethod
++    @retrying.retry(
++        retry_on_exception=(lambda e: isinstance(e, exceptions.EnvError)),
++        stop_max_attempt_number=5,
++        wait_fixed=1000)
++    def _hctl_to_disk(self, pci_bus, target):
++        """Map HCTL to physical disk"""
++        out = subprocess.check_output(['lsblk', '-o', 'NAME,HCTL', '-d', '-n',
++                                       '-J'])
++        lsblk_json = json.loads(out)
++
++        for disk in lsblk_json['blockdevices']:
++            # udevadm info -q symlink -n /dev/sdt
++            try:
++                out = subprocess.check_output(['udevadm', 'info', '-q',
++                                               'all', '-n', '/dev/{}'
++                                               .format(disk['name'])])
++            except subprocess.CalledProcessError:
++                LOG.debug('Device /dev/{} not found'.format(disk['name']))
++                continue
++
++            for line in out.split('\n'):
++                re_pci = re.match('P:\s/devices/pci\d+:\d+/\d+:\d+:\d+.\d+/\d+'
++                                  ':(\d+:\d+.\d+)/host\d+/target\d+:\d+:\d+'
++                                  '/(\d+:\d+:\d+:\d+)/block/[a-z]+', line)
++
++                if re_pci:
++                    pci = re_pci.groups()[0]
++                    hctl = re_pci.groups()[1]
++                    vd_target = hctl.split(':')[2]
++                    if pci == pci_bus and disk['hctl'] == hctl \
++                       and vd_target == target:
++                        return '/dev/{}'.format(disk['name'])
++
++                    continue
++
++        raise exceptions.EnvError('No RAID has been created')
++
++    @classmethod
++    def _get_adapters_count(self):
++        """Return count of MegaRAID controllers"""
++        out = subprocess.check_output(['lspci', '-nn'])
++        count = 0
++        for line in out.split('\n'):
++            if line.find('MegaRAID') > -1:
++                count += 1
++
++        return count
++
++    @classmethod
++    def _get_adapters_to_pci_bus(self):
++        """Return PCI bus number for given controller"""
++        adapters_count = self._get_adapters_count()
++        adapter_to_pci_bus = {}
++        for adapter_id in range(0, adapters_count):
++            out = subprocess.check_output([self._megacli_path,
++                                           '-AdpAllInfo',
++                                           '-a{}'.format(adapter_id)])
++
++            vendor = device = None
++            for line in out.split('\n'):
++                re_vendor = re.match('Vendor\sId\s+:\s([a-f0-9]+)', line)
++                if re_vendor:
++                    vendor = re_vendor.groups()[0]
++                    continue
++
++                re_device = re.match('Device\sId\s+:\s([a-f0-9]+)', line)
++                if re_device:
++                    device = re_device.groups()[0]
++                    continue
++
++            if not all([vendor, device]):
++                if not vendor:
++                    msg = "No vendor ID in adapter {}".format(adapter_id)
++                if not device:
++                    msg += "No Device ID in adapter {}".format(adapter_id)
++                raise exceptions.EnvError(msg)
++
++            pci = "{vendor}:{device}".format(vendor=vendor, device=device)
++
++            out = subprocess.check_output(['lspci', '-nn'])
++            for line in out.split('\n'):
++                if line.find('MegaRAID') > -1 and line.find(pci) > -1:
++                    pci_bus = self._get_bus_from_lspci(line)
++                    adapter_to_pci_bus[str(adapter_id)] = pci_bus
++
++        return adapter_to_pci_bus
++
++    @classmethod
++    def _delete_raid(self, vd_target, adapter):
++        hctl = self._get_adapters_to_pci_bus()[adapter]
++        disk = self._hctl_to_disk(hctl, vd_target)
++        out = subprocess.check_output(['lsblk', '-o', 'NAME,HCTL', '-d',
++                                       '-n', '-J', disk])
++        hctl = json.loads(out)['blockdevices'][0]['hctl']
++        # form of 0:2:0:0
++        scsi_id = hctl.split(':')[2]
++        subprocess.check_call([self._megacli_path, '-CfgLdDel',
++                               '-L{}'.format(scsi_id), '-a{}'.format(adapter)])
++
++    @classmethod
++    def _get_vd_info(self, disk):
++        adapter_to_pci_bus = self._get_adapters_to_pci_bus()
++        for adapter in adapter_to_pci_bus.keys():
++            try:
++                out = subprocess.check_output(['udevadm', 'info', '-q',
++                                               'all', '-n', '{}'
++                                               .format(disk)])
++            except subprocess.CalledProcessError:
++                raise exceptions.EnvError('Device /dev/{} not found'
++                                          .format(disk['name']))
++            for line in out.split('\n'):
++                re_pci = re.match('S:\sdisk/by-path/pci-\d+:(\d+:\d+.\d)'
++                                  '-scsi-(\d:\d:\d:\d)', line)
++
++                if re_pci:
++                    pci = re_pci.groups()[0]
++                    hctl = re_pci.groups()[1]
++                    vd_target = hctl.split(":")[2]
++                    if pci == adapter_to_pci_bus[adapter]:
++                        return {'adapter': adapter, 'target': vd_target}
++
++        return
++
++    # MegaCli64 -LDInfo -Lall -aAll
++    @classmethod
++    def _get_all_vds(self):
++        megacli = subprocess.check_output([self._megacli_path, '-LDInfo',
++                                           '-Lall', '-aAll'])
++
++        output = {}
++        target = adapter = None
++
++        for line in megacli.split('\n'):
++            # Adapter 0 -- Virtual Drive Information:
++            re_adapter = re.match('Adapter\s(\d+)', line)
++            if re_adapter:
++                adapter = re_adapter.groups()[0]
++                output[adapter] = []
++
++            if not adapter:
++                continue
++
++            # Virtual Drive: 1 (Target Id: 1)
++            re_target = re.match('Virtual\sDrive:\s\d+\s\(Target\sId:\s(\d+)',
++                                 line)
++            if re_target:
++                target = re_target.groups()[0]
++                output[adapter].append(target)
++
++        return output
++
++    @classmethod
++    def clean_disks(self, excluded_devices):
++        """Cleaning all previous RAIDs and switching all disks to JBOD
++
++        :param: devices dict with mapping of logical drives to physical drives
++                that has to be preserved
++                example:
++                excluded_devices = {'disk0': "/dev/sdc", "raid0": "/dev/sda"}
++
++        """
++
++        pds = self._get_not_jbod_disks()
++        lds = self._get_lds_info()
++        pds_in_lds = self._get_pds_in_lds()
++        stripe_size = self.default_stripe_size
++
++        for ctrl in lds:
++            # filter disks which aren't already in good state
++            jbod_pds = [pd for pd in pds[ctrl]
++                        if self._get_firmware_state(pd, ctrl) == 'jbod']
++            # make them good
++            self._make_disks_good(jbod_pds, ctrl)
++            # make jbod out of them
++            self._make_disks_jbod(pds[ctrl], stripe_size, ctrl, pds_in_lds)
++            # repopulate pds_in_lds after cleaning disks
++            pds_in_lds = self._get_pds_in_lds()
++
++            for ld in lds[ctrl]:
++                # skip cleaning raids in excluded_devices
++                if lds[ctrl][ld].get('disk') in excluded_devices.values():
++                    continue
++
++                raidtype = lds[ctrl][ld]['raidtype']
++                disks_num = lds[ctrl][ld]['disks_num']
++
++                # skip disks that are already JBOD
++                if raidtype == 0 and disks_num == 1:
++                    continue
++
++                encs = pds_in_lds[ctrl][ld]
++                LOG.debug('Deleteing raid {} on ctrl {}'.format(ld, ctrl))
++                # delete raid
++                self._delete_raid(ld, ctrl)
++                # transform disks that made ld to JBOD
++                LOG.debug('Making disks: {} on ctrl'
++                          ' JBOD'.format(pds_in_lds[ctrl][ld], ctrl))
++                # reread pds_in_lds after deleting RAID
++                pds_in_lds = self._get_pds_in_lds()
++                self._make_disks_jbod(encs, stripe_size, ctrl, pds_in_lds)
++
++    def _get_disks_count(self):
++        """Get overall number of blockdevices seen in Linux"""
++        out = subprocess.check_output(['lsblk', '-n', '-d', '-o', 'NAME'])
++        return len(str(out).strip().split('\n'))
+ 
+     @staticmethod
+     def is_megacli_controller():
++        out = subprocess.check_output(['lspci', '-nn'])
++        for line in out.split('\n'):
++            if line.find('MegaRAID') > -1:
++                return True
++
+         return False
++
++    # MegaCli64 -LdPdInfo -a0
++    @classmethod
++    def _get_lds_info(self):
++        """Get information about created Virtual Drives"""
++        adapter_to_pci_bus = self._get_adapters_to_pci_bus()
++        output = subprocess.check_output([self._megacli_path, '-LdPdInfo',
++                                          '-aAll'])
++
++        adapter = disks_num = vd_target = raidtype = span = None
++        disk_per_span = None
++        mapping = {}
++
++        for line in output.split('\n'):
++            re_adapter = re.match('Adapter\s#(\d+)', line.strip())
++            if re_adapter:
++                adapter = str(re_adapter.groups()[0])
++                mapping[adapter] = {}
++                continue
++
++            if not adapter:
++                continue
++
++            re_tar = re.match('Virtual\sDrive:\s\d+\s\(Target\sId:\s(\d+)\)',
++                              line.strip())
++            if re_tar:
++                vd_target = str(re_tar.groups()[0])
++                mapping[adapter][vd_target] = {}
++                continue
++
++            if not vd_target:
++                continue
++
++            re_raidtype = re.match('RAID\sLevel\s+:\sPrimary-(\d+)',
++                                   line.strip())
++            if re_raidtype:
++                raidtype = int(re_raidtype.groups()[0])
++                continue
++
++            re_disks_num = re.match('Number\sOf\sDrives\s+:\s(\d+)',
++                                    line.strip())
++
++            if re_disks_num:
++                disks_num = re_disks_num.groups()[0]
++                mapping[adapter][vd_target]['disks_num'] = int(disks_num)
++                continue
++
++            re_disk_per_span = re.match('Number\sOf\sDrives\sper\sspan:(\d+)',
++                                        line.strip())
++
++            if re_disk_per_span:
++                disk_per_span = re_disk_per_span.groups()[0]
++                continue
++
++            re_span = re.match('Span\sDepth\s+:\s(\d+)', line.strip())
++            if re_span:
++                span = int(re_span.groups()[0])
++                if raidtype == 1 and span == 1:
++                    mapping[adapter][vd_target]['raidtype'] = 1
++                elif raidtype == 1 and span > 1:
++                    mapping[adapter][vd_target]['raidtype'] = 10
++                    disks_num = int(span) * int(disk_per_span)
++                    mapping[adapter][vd_target]['disks_num'] = disks_num
++                else:
++                    mapping[adapter][vd_target]['raidtype'] = int(raidtype)
++
++                continue
++
++            if all([span, disks_num, vd_target]):
++                hctl = adapter_to_pci_bus[adapter]
++                disk = self._hctl_to_disk(hctl, vd_target)
++                mapping[adapter][vd_target]['disk'] = disk
++                disks_num = vd_target = raidtype = span = None
++
++        return mapping
++
++    @classmethod
++    def _get_pds_in_lds(self):
++        output = subprocess.check_output([self._megacli_path, '-LdPdInfo',
++                                          '-aAll'])
++        adapter = vd_target = enclosure = slot = None
++        mapping = {}
++
++        for line in output.split('\n'):
++            re_adapter = re.match('Adapter\s#(\d+)', line.strip())
++            if re_adapter:
++                adapter = str(re_adapter.groups()[0])
++                mapping[adapter] = {}
++                continue
++
++            if not adapter:
++                continue
++
++            re_tar = re.match('Virtual\sDrive:\s\d+\s\(Target\sId:\s(\d+)\)',
++                              line.strip())
++            if re_tar:
++                vd_target = str(re_tar.groups()[0])
++                mapping[adapter][vd_target] = []
++                continue
++
++            if not vd_target:
++                continue
++
++            re_enclosure = re.match('Enclosure\sDevice\sID:\s(\d+)', line)
++            if re_enclosure:
++                enclosure = re_enclosure.groups()[0]
++                continue
++
++            if not enclosure:
++                continue
++
++            re_slot = re.match('Slot\sNumber:\s(\d+)', line)
++            if re_slot:
++                slot = re_slot.groups()[0]
++                continue
++
++            if not slot:
++                continue
++
++            if slot and enclosure:
++                mapping[adapter][vd_target].append('{}:{}'.format(enclosure,
++                                                                  slot))
++                slot = enclosure = None
++
++        return mapping
++
++    def setup_disks(self, devices):
++        """Format disks or setup RAID/LVM. Return created devices dict."""
++        # retrieve mapping between physical disks and adapter:enc pair
++        devices.update(partitionsetup.PartitionSetup(self.conf_part)
++                       .get_not_partitioned_candidates())
++        adapter_to_pci_bus = self._get_adapters_to_pci_bus()
++        created_raids = {}
++        raids = [raid for raid in self.conf.keys()
++                 if raid not in devices.keys()]
++
++        lds = self._get_lds_info()
++        stripe_size = self.default_stripe_size
++
++        for raid in raids:
++            raidtype = self.conf[raid]['raidtype']
++            # get stripe size
++            if self.conf[raid].get('stripe_size'):
++                stripe_size = int(self.conf[raid].get('stripe_size'))
++
++            # logical disks to make RAID from
++            partitions = self.conf[raid]['partitions']
++            # retrieve adapter for disks and validate if all of them are on
++            # one adapter
++            adapter = tools.get_controller_for_disks(partitions, devices, lds)
++            # get list of Physical Drives in Logical Drives
++            pds_in_lds = self._get_pds_in_lds()
++            # get list of Physical Drives that will make a RAID
++            pds = tools.get_pds_for_raid(partitions, devices, adapter, lds,
++                                         pds_in_lds)
++            # make RAID
++            vd_target = self._make_raid(raidtype, stripe_size, pds, adapter,
++                                        pds_in_lds)
++            # update lds
++            lds = self._get_lds_info()
++
++            # translate created raid to a disk seen in Linux
++            hctl = adapter_to_pci_bus[adapter]
++            created_raid = self._hctl_to_disk(hctl, vd_target)
++            created_raids[raid] = created_raid
++
++        devices.update(created_raids)
++        return devices
+diff --git a/ironic_lib/system_installer/tools.py b/ironic_lib/system_installer/tools.py
+index aaacf67..c4868f9 100644
+--- a/ironic_lib/system_installer/tools.py
++++ b/ironic_lib/system_installer/tools.py
+@@ -17,6 +17,8 @@ import collections
+ import json
+ import yaml
+ 
++from ironic_lib.system_installer import exceptions
++
+ 
+ def ordered_load(disk_conf):
+     """Load JSON or YAML configuration as OrderedDicts"""
+@@ -41,3 +43,81 @@ def get_memsize_kB():
+     with open('/proc/meminfo', 'r') as f:
+         # take first line which is MemTotal and grab its value with unit
+         return f.read().split('\n')[0].split()[1]
++
++
++def validate_raid(raidtype, partitions):
++    raid_map = {0: {'min': 1},
++                1: {'min': 2, 'parity': True},
++                5: {'min': 3},
++                6: {'min': 4},
++                10: {'min': 4, 'parity': True}}
++
++    parity = False
++    if raid_map[raidtype].get('parity'):
++        parity = len(partitions) % 2 != 0
++
++    if len(partitions) < raid_map[raidtype]['min'] or parity:
++        return False
++
++    return True
++
++
++def get_pds_for_raid(partitions, devices, controller, lds, pds_in_lds):
++
++    """Return Physical Drives from given partitions.
++
++    Make sure those disks are single drive RAID0 -> equivalent for JBOD.
++    """
++
++    pds = []
++    for partition in partitions:
++        disk = devices[partition]
++        for ld in lds[controller]:
++            disk_name = lds[controller][ld]['disk']
++            raidtype = lds[controller][ld]['raidtype']
++            disks_num = lds[controller][ld]['disks_num']
++
++            if disk == disk_name and raidtype == 0 and disks_num == 1:
++                pds.append(pds_in_lds[controller][ld][0])
++
++            elif disk == disk_name and raidtype != 0:
++                raise exceptions.EnvError('Disk {} is not'
++                                          ' RAID0'.format(disk))
++
++            elif disk == disk_name and disks_num != 1:
++                raise exceptions.EnvError('Disk {} is not made'
++                                          ' from one drive'.format(disk))
++
++    return pds
++
++
++def get_controller_for_disks(partitions, devices, lds):
++
++    """Return controller for given disks.
++
++    Check if they are on one controller.
++    """
++
++    if len(lds.keys()) == 1:
++        return list(lds.keys())[0]
++
++    disk_to_controller = {}
++
++    for partition in partitions:
++        for controller in lds:
++            for ld in lds[controller]:
++                disk = devices[partition]
++                if disk in list(lds[controller][ld].values()):
++                    disk_to_controller[disk] = controller
++
++    ctrl_for_disks = list(disk_to_controller.values())
++    if not all(ctrl == ctrl_for_disks[0] for ctrl in ctrl_for_disks):
++        raise exceptions.EnvError(
++            'Disks chosen to become RAID are not on the same adapter')
++
++    return ctrl_for_disks[0]
++
++
++class classproperty(property):
++    def __get__(self, cls, owner):
++        return self.fget.__get__(None, owner)()
+diff --git a/ironic_lib/tests/examples/example_efi.yaml b/ironic_lib/tests/examples/example_efi.yaml
+index fe774d9..2a9a7b9 100644
+--- a/ironic_lib/tests/examples/example_efi.yaml
++++ b/ironic_lib/tests/examples/example_efi.yaml
+@@ -2,8 +2,7 @@ disk_config:
+   partition_table: gpt
+   blockdev:
+     sda:
+-      candidates:
+-        serial: 55cd2e404c02bac5
++      candidates: any
+       partitions:
+         d0p1:
+           size: 550M
+diff --git a/ironic_lib/tests/examples/megacli.yml b/ironic_lib/tests/examples/megacli.yml
+new file mode 100644
+index 0000000..c98ad4f
+--- /dev/null
++++ b/ironic_lib/tests/examples/megacli.yml
+@@ -0,0 +1,12 @@
++disk_config:
++  blockdev:
++    disk0:
++      candidates: any
++    disk1:
++      candidates: any
++  hwraid:
++    raid0:
++      raidtype: 1
++      partitions:
++        - disk0
++        - disk1
+diff --git a/ironic_lib/tests/examples/megacli_2_raids.yml b/ironic_lib/tests/examples/megacli_2_raids.yml
+new file mode 100644
+index 0000000..5f89667
+--- /dev/null
++++ b/ironic_lib/tests/examples/megacli_2_raids.yml
+@@ -0,0 +1,22 @@
++
++disk_config:
++  blockdev:
++    disk0:
++      candidates: any
++    disk1:
++      candidates: any
++    disk2:
++      candidates: any
++    disk3:
++      candidates: any
++  hwraid:
++    raid0:
++      raidtype: 1
++      partitions:
++        - disk0
++        - disk1
++    raid1:
++      raidtype: 1
++      partitions:
++        - disk2
++        - disk3
+diff --git a/ironic_lib/tests/examples/megacli_cmd_outputs/lspci_output.txt b/ironic_lib/tests/examples/megacli_cmd_outputs/lspci_output.txt
+new file mode 100644
+index 0000000..db45214
+--- /dev/null
++++ b/ironic_lib/tests/examples/megacli_cmd_outputs/lspci_output.txt
+@@ -0,0 +1,7 @@
++00:1f.2 SATA controller: Intel Corporation C610/X99 series chipset 6-Port SATA Controller [AHCI mode] (rev 05)
++01:00.0 Ethernet controller: Intel Corporation 82599ES 10-Gigabit SFI/SFP+ Network Connection (rev 01)
++01:00.1 Ethernet controller: Intel Corporation 82599ES 10-Gigabit SFI/SFP+ Network Connection (rev 01)
++02:00.0 RAID bus controller: LSI Logic / Symbios Logic MegaRAID SAS-3 3108 [Invader] (rev 02)
++06:00.0 Ethernet controller: Intel Corporation I350 Gigabit Network Connection (rev 01)
++06:00.1 Ethernet controller: Intel Corporation I350 Gigabit Network Connection (rev 01)
++07:00.0 PCI bridge: Renesas Technology Corp. SH7758 PCIe Switch [PS]
+diff --git a/ironic_lib/tests/examples/megacli_cmd_outputs/megacli_adinfo_output.txt b/ironic_lib/tests/examples/megacli_cmd_outputs/megacli_adinfo_output.txt
+new file mode 100644
+index 0000000..169550a
+--- /dev/null
++++ b/ironic_lib/tests/examples/megacli_cmd_outputs/megacli_adinfo_output.txt
+@@ -0,0 +1,303 @@
++
++Adapter #0
++
++==============================================================================
++                    Versions
++                ================
++Product Name    : PERC H730 Mini
++Serial No       : 53702BF
++FW Package Build: 25.2.2-0004
++
++                    Mfg. Data
++                ================
++Mfg. Date       : 03/09/15
++Rework Date     : 03/09/15
++Revision No     : A00
++Battery FRU     : N/A
++
++                Image Versions in Flash:
++                ================
++BIOS Version       : 6.18.03.0_4.16.07.00_0x06070400
++Ctrl-R Version     : 5.03-0010
++FW Version         : 4.241.00-4163
++NVDATA Version     : 3.1310.00-0084
++Boot Block Version : 3.02.00.00-0000
++
++                Pending Images in Flash
++                ================
++None
++
++                PCI Info
++                ================
++Controller Id   : 0000
++Vendor Id       : 1000
++Device Id       : 005d
++SubVendorId     : 1028
++SubDeviceId     : 1f49
++
++Host Interface  : PCIE
++
++ChipRevision    : C0
++
++Link Speed           : 3
++Number of Frontend Port: 0
++Device Interface  : PCIE
++
++Number of Backend Port: 8
++Port  :  Address
++0        500056b31234abff
++1        0000000000000000
++2        0000000000000000
++3        0000000000000000
++4        0000000000000000
++5        0000000000000000
++6        0000000000000000
++7        0000000000000000
++
++                HW Configuration
++                ================
++SAS Address      : 544a84201ed45b00
++BBU              : Present
++Alarm            : Absent
++NVRAM            : Present
++Serial Debugger  : Present
++Memory           : Present
++Flash            : Present
++Memory Size      : 1024MB
++TPM              : Absent
++On board Expander: Absent
++Upgrade Key      : Absent
++Temperature sensor for ROC    : Present
++Temperature sensor for controller    : Present
++
++ROC temperature : 49  degree Celsius
++Controller temperature : 49  degree Celcius
++
++                Settings
++                ================
++Current Time                     : 12:49:11 1/19, 2018
++Predictive Fail Poll Interval    : 300sec
++Interrupt Throttle Active Count  : 16
++Interrupt Throttle Completion    : 50us
++Rebuild Rate                     : 30%
++PR Rate                          : 30%
++BGI Rate                         : 30%
++Check Consistency Rate           : 30%
++Reconstruction Rate              : 30%
++Cache Flush Interval             : 4s
++Max Drives to Spinup at One Time : 4
++Delay Among Spinup Groups        : 12s
++Physical Drive Coercion Mode     : 128MB
++Cluster Mode                     : Disabled
++Alarm                            : Disabled
++Auto Rebuild                     : Enabled
++Battery Warning                  : Enabled
++Ecc Bucket Size                  : 255
++Ecc Bucket Leak Rate             : 240 Minutes
++Restore HotSpare on Insertion    : Disabled
++Expose Enclosure Devices         : Disabled
++Maintain PD Fail History         : Disabled
++Host Request Reordering          : Enabled
++Auto Detect BackPlane Enabled    : SGPIO/i2c SEP
++Load Balance Mode                : Auto
++Use FDE Only                     : Yes
++Security Key Assigned            : No
++Security Key Failed              : No
++Security Key Not Backedup        : No
++Default LD PowerSave Policy      : Controller Defined
++Maximum number of direct attached drives to spin up in 1 min : 0
++Auto Enhanced Import             : No
++Any Offline VD Cache Preserved   : No
++Allow Boot with Preserved Cache  : No
++Disable Online Controller Reset  : No
++PFK in NVRAM                     : No
++Use disk activity for locate     : No
++POST delay                       : 90 seconds
++BIOS Error Handling              : Pause on Errors
++Current Boot Mode                 :Normal
++                Capabilities
++                ================
++RAID Level Supported             : RAID0, RAID1, RAID5, RAID6, RAID10, RAID50, RAID60, PRL 11, PRL 11 with spanning, PRL11-RLQ0 DDF layout with no span, PRL11-RLQ0 DDF layout with span
++Supported Drives                 : SAS, SATA
++
++Allowed Mixing:
++
++Mix in Enclosure Allowed
++
++                Status
++                ================
++ECC Bucket Count                 : 0
++
++                Limitations
++                ================
++Max Arms Per VD          : 32
++Max Spans Per VD         : 8
++Max Arrays               : 128
++Max Number of VDs        : 64
++Max Parallel Commands    : 928
++Max SGE Count            : 60
++Max Data Transfer Size   : 8192 sectors
++Max Strips PerIO         : 42
++Max LD per array         : 16
++Min Strip Size           : 64 KB
++Max Strip Size           : 1.0 MB
++Max Configurable CacheCade Size: 0 GB
++Current Size of CacheCade      : 0 GB
++Current Size of FW Cache       : 939 MB
++
++                Device Present
++                ================
++Virtual Drives    : 0
++  Degraded        : 0
++  Offline         : 0
++Physical Devices  : 25
++  Disks           : 24
++  Critical Disks  : 0
++  Failed Disks    : 0
++
++                Supported Adapter Operations
++                ================
++Rebuild Rate                    : Yes
++CC Rate                         : Yes
++BGI Rate                        : Yes
++Reconstruct Rate                : Yes
++Patrol Read Rate                : Yes
++Alarm Control                   : Yes
++Cluster Support                 : No
++BBU                             : Yes
++Spanning                        : Yes
++Dedicated Hot Spare             : Yes
++Revertible Hot Spares           : Yes
++Foreign Config Import           : Yes
++Self Diagnostic                 : Yes
++Allow Mixed Redundancy on Array : No
++Global Hot Spares               : Yes
++Deny SCSI Passthrough           : No
++Deny SMP Passthrough            : No
++Deny STP Passthrough            : No
++Support Security                : Yes
++Snapshot Enabled                : No
++Support the OCE without adding drives : Yes
++Support PFK                     : No
++Support PI                      : Yes
++Support Boot Time PFK Change    : No
++Disable Online PFK Change       : No
++Support LDPI Type1                      : No
++Support LDPI Type2                      : Yes
++Support LDPI Type3                      : No
++Support Shield State            : Yes
++Block SSD Write Disk Cache Change: No
++Support Online FW Update        : Yes
++
++                Supported VD Operations
++                ================
++Read Policy          : Yes
++Write Policy         : Yes
++IO Policy            : Yes
++Access Policy        : Yes
++Disk Cache Policy    : Yes
++Reconstruction       : Yes
++Deny Locate          : No
++Deny CC              : No
++Allow Ctrl Encryption: No
++Enable LDBBM         : Yes
++Support Breakmirror  : Yes
++Power Savings        : Yes
++
++                Supported PD Operations
++                ================
++Force Online                            : Yes
++Force Offline                           : Yes
++Force Rebuild                           : Yes
++Deny Force Failed                       : No
++Deny Force Good/Bad                     : No
++Deny Missing Replace                    : No
++Deny Clear                              : No
++Deny Locate                             : No
++Support Temperature                     : Yes
++NCQ                                     : No
++Disable Copyback                        : No
++Enable JBOD                             : Yes
++Enable Copyback on SMART                : No
++Enable Copyback to SSD on SMART Error   : No
++Enable SSD Patrol Read                  : No
++PR Correct Unconfigured Areas           : Yes
++Enable Spin Down of UnConfigured Drives : No
++Disable Spin Down of hot spares         : Yes
++Spin Down time                          : 30
++T10 Power State                         : Yes
++                Error Counters
++                ================
++Memory Correctable Errors   : 0
++Memory Uncorrectable Errors : 0
++
++                Cluster Information
++                ================
++Cluster Permitted     : No
++Cluster Active        : No
++
++                Default Settings
++                ================
++Phy Polarity                     : 0
++Phy PolaritySplit                : 0
++Background Rate                  : 30
++Strip Size                       : 64kB
++Flush Time                       : 4 seconds
++Write Policy                     : WB
++Read Policy                      : Adaptive
++Cache When BBU Bad               : Disabled
++Cached IO                        : No
++SMART Mode                       : Mode 6
++Alarm Disable                    : No
++Coercion Mode                    : 128MB
++ZCR Config                       : Unknown
++Dirty LED Shows Drive Activity   : No
++BIOS Continue on Error           : 1
++Spin Down Mode                   : None
++Allowed Device Type              : SAS/SATA Mix
++Allow Mix in Enclosure           : Yes
++Allow HDD SAS/SATA Mix in VD     : No
++Allow SSD SAS/SATA Mix in VD     : No
++Allow HDD/SSD Mix in VD          : No
++Allow SATA in Cluster            : No
++Max Chained Enclosures           : 4
++Disable Ctrl-R                   : No
++Enable Web BIOS                  : No
++Direct PD Mapping                : Yes
++BIOS Enumerate VDs               : Yes
++Restore Hot Spare on Insertion   : No
++Expose Enclosure Devices         : No
++Maintain PD Fail History         : No
++Disable Puncturing               : No
++Zero Based Enclosure Enumeration : Yes
++PreBoot CLI Enabled              : No
++LED Show Drive Activity          : Yes
++Cluster Disable                  : Yes
++SAS Disable                      : No
++Auto Detect BackPlane Enable     : SGPIO/i2c SEP
++Use FDE Only                     : Yes
++Enable Led Header                : No
++Delay during POST                : 0
++EnableCrashDump                  : No
++Disable Online Controller Reset  : No
++EnableLDBBM                      : Yes
++Un-Certified Hard Disk Drives    : Allow
++Treat Single span R1E as R10     : Yes
++Max LD per array                 : 16
++Power Saving option              : Don't spin down unconfigured drives
++Don't spin down Hot spares
++Don't Auto spin down Configured Drives
++Power settings apply to all drives - individual PD/LD power settings cannot be set
++Max power savings option is  not allowed for LDs. Only T10 power conditions are to be used.
++Cached writes are not used for spun down VDs
++Can schedule disable power savings at controller level
++Default spin down time in minutes: 30
++Enable JBOD                      : Yes
++TTY Log In Flash                 : Yes
++Auto Enhanced Import             : No
++BreakMirror RAID Support         : Yes
++Disable Join Mirror              : Yes
++Enable Shield State              : No
++Time taken to detect CME         : 60s
++
++Exit Code: 0x00
+diff --git a/ironic_lib/tests/examples/megacli_cmd_outputs/megacli_ld_output.txt b/ironic_lib/tests/examples/megacli_cmd_outputs/megacli_ld_output.txt
+new file mode 100644
+index 0000000..a310a4c
+--- /dev/null
++++ b/ironic_lib/tests/examples/megacli_cmd_outputs/megacli_ld_output.txt
+@@ -0,0 +1,33 @@
++
++
++Adapter 0 -- Virtual Drive Information:
++Virtual Drive: 0 (Target Id: 0)
++Name                :
++RAID Level          : Primary-1, Secondary-0, RAID Level Qualifier-0
++Size                : 223.0 GB
++Sector Size         : 512
++Is VD emulated      : Yes
++Mirror Data         : 223.0 GB
++State               : Optimal
++Strip Size          : 64 KB
++Number Of Drives    : 2
++Span Depth          : 1
++Default Cache Policy: WriteBack, ReadAdaptive, Direct, No Write Cache if Bad BBU
++Current Cache Policy: WriteBack, ReadAdaptive, Direct, No Write Cache if Bad BBU
++Default Access Policy: Read/Write
++Current Access Policy: Read/Write
++Disk Cache Policy   : Disk's Default
++Encryption Type     : None
++Default Power Savings Policy: Controller Defined
++Current Power Savings Policy: None
++Can spin up in 1 minute: No
++LD has drives that support T10 power conditions: No
++LD's IO profile supports MAX power savings with cached writes: No
++Bad Blocks Exist: No
++PI type: No PI
++
++Is VD Cached: No
++
++
++
++Exit Code: 0x00
+diff --git a/ironic_lib/tests/examples/megacli_cmd_outputs/megacli_ldinfo_2lds_output.txt b/ironic_lib/tests/examples/megacli_cmd_outputs/megacli_ldinfo_2lds_output.txt
+new file mode 100644
+index 0000000..c90a811
+--- /dev/null
++++ b/ironic_lib/tests/examples/megacli_cmd_outputs/megacli_ldinfo_2lds_output.txt
+@@ -0,0 +1,65 @@
++
++
++Adapter 0 -- Virtual Drive Information:
++Virtual Drive: 0 (Target Id: 0)
++Name                :
++RAID Level          : Primary-0, Secondary-0, RAID Level Qualifier-0
++Size                : 446.0 GB
++Sector Size         : 512
++Is VD emulated      : Yes
++Parity Size         : 0
++State               : Optimal
++Strip Size          : 64 KB
++Number Of Drives    : 2
++Span Depth          : 1
++Default Cache Policy: WriteBack, ReadAdaptive, Direct, No Write Cache if Bad
++BBU
++Current Cache Policy: WriteBack, ReadAdaptive, Direct, No Write Cache if Bad
++BBU
++Default Access Policy: Read/Write
++Current Access Policy: Read/Write
++Disk Cache Policy   : Disk's Default
++Encryption Type     : None
++Default Power Savings Policy: Controller Defined
++Current Power Savings Policy: None
++Can spin up in 1 minute: No
++LD has drives that support T10 power conditions: No
++LD's IO profile supports MAX power savings with cached writes: No
++Bad Blocks Exist: No
++PI type: No PI
++
++Is VD Cached: No
++
++
++Virtual Drive: 1 (Target Id: 1)
++Name                :
++RAID Level          : Primary-0, Secondary-0, RAID Level Qualifier-0
++Size                : 446.0 GB
++Sector Size         : 512
++Is VD emulated      : Yes
++Parity Size         : 0
++State               : Optimal
++Strip Size          : 64 KB
++Number Of Drives    : 2
++Span Depth          : 1
++Default Cache Policy: WriteBack, ReadAdaptive, Direct, No Write Cache if Bad
++BBU
++Current Cache Policy: WriteBack, ReadAdaptive, Direct, No Write Cache if Bad
++BBU
++Default Access Policy: Read/Write
++Current Access Policy: Read/Write
++Disk Cache Policy   : Disk's Default
++Encryption Type     : None
++Default Power Savings Policy: Controller Defined
++Current Power Savings Policy: None
++Can spin up in 1 minute: No
++LD has drives that support T10 power conditions: No
++LD's IO profile supports MAX power savings with cached writes: No
++Bad Blocks Exist: No
++PI type: No PI
++
++Is VD Cached: No
++
++
++
++Exit Code: 0x00
+diff --git a/ironic_lib/tests/examples/megacli_cmd_outputs/megacli_ldpdinfo.txt b/ironic_lib/tests/examples/megacli_cmd_outputs/megacli_ldpdinfo.txt
+new file mode 100644
+index 0000000..a50eee7
+--- /dev/null
++++ b/ironic_lib/tests/examples/megacli_cmd_outputs/megacli_ldpdinfo.txt
+@@ -0,0 +1,292 @@
++                                     
++Adapter #0
++
++Number of Virtual Disks: 3
++Virtual Drive: 0 (Target Id: 0)
++Name                :
++RAID Level          : Primary-0, Secondary-0, RAID Level Qualifier-0
++Size                : 558.406 GB
++Sector Size         : 512
++Is VD emulated      : No
++Parity Size         : 0
++State               : Optimal
++Strip Size          : 256 KB
++Number Of Drives    : 1
++Span Depth          : 1
++Default Cache Policy: WriteBack, ReadAdaptive, Direct, No Write Cache if Bad BBU
++Current Cache Policy: WriteThrough, ReadAdaptive, Direct, No Write Cache if Bad BBU
++Default Access Policy: Read/Write
++Current Access Policy: Read/Write
++Disk Cache Policy   : Disk's Default
++Encryption Type     : None
++PI type: No PI
++
++Is VD Cached: No
++Number of Spans: 1
++Span: 0 - Number of PDs: 1
++
++PD: 0 Information
++Enclosure Device ID: 252
++Slot Number: 0
++Drive's position: DiskGroup: 0, Span: 0, Arm: 0
++Enclosure position: N/A
++Device Id: 11
++WWN: 5000C5008809C900
++Sequence Number: 6
++Media Error Count: 0
++Other Error Count: 0
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SAS
++
++Raw Size: 558.911 GB [0x45dd2fb0 Sectors]
++Non Coerced Size: 558.411 GB [0x45cd2fb0 Sectors]
++Coerced Size: 558.406 GB [0x45cd0000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  512
++Firmware state: Online, Spun Up
++Commissioned Spare : No
++Emergency Spare : No
++Device Firmware Level: 000B
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x5000c5008809c901
++SAS Address(1): 0x0
++Connected Port Number: 0(path0) 
++Inquiry Data: SEAGATE ST3600057SS     000B6SL9W65G            
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None 
++Device Speed: 6.0Gb/s 
++Link Speed: 6.0Gb/s 
++Media Type: Hard Disk Device
++Drive:  Not Certified
++Drive Temperature :48C (118.40 F)
++PI Eligibility:  No 
++Drive is formatted for PI information:  No
++PI: No PI
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Port-1 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++Virtual Drive: 1 (Target Id: 1)
++Name                :
++RAID Level          : Primary-0, Secondary-0, RAID Level Qualifier-0
++Size                : 558.406 GB
++Sector Size         : 512
++Is VD emulated      : No
++Parity Size         : 0
++State               : Optimal
++Strip Size          : 256 KB
++Number Of Drives    : 1
++Span Depth          : 1
++Default Cache Policy: WriteBack, ReadAdaptive, Direct, No Write Cache if Bad BBU
++Current Cache Policy: WriteThrough, ReadAdaptive, Direct, No Write Cache if Bad BBU
++Default Access Policy: Read/Write
++Current Access Policy: Read/Write
++Disk Cache Policy   : Disk's Default
++Encryption Type     : None
++PI type: No PI
++
++Is VD Cached: No
++Number of Spans: 1
++Span: 0 - Number of PDs: 1
++
++PD: 0 Information
++Enclosure Device ID: 252
++Slot Number: 1
++Drive's position: DiskGroup: 1, Span: 0, Arm: 0
++Enclosure position: N/A
++Device Id: 8
++WWN: 5000C5007F9F69F8
++Sequence Number: 6
++Media Error Count: 0
++Other Error Count: 0
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SAS
++
++Raw Size: 558.911 GB [0x45dd2fb0 Sectors]
++Non Coerced Size: 558.411 GB [0x45cd2fb0 Sectors]
++Coerced Size: 558.406 GB [0x45cd0000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  512
++Firmware state: Online, Spun Up
++Commissioned Spare : No
++Emergency Spare : No
++Device Firmware Level: 000B
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x5000c5007f9f69f9
++SAS Address(1): 0x0
++Connected Port Number: 1(path0) 
++Inquiry Data: SEAGATE ST3600057SS     000B6SL9XPY2            
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None 
++Device Speed: 6.0Gb/s 
++Link Speed: 6.0Gb/s 
++Media Type: Hard Disk Device
++Drive:  Not Certified
++Drive Temperature :48C (118.40 F)
++PI Eligibility:  No 
++Drive is formatted for PI information:  No
++PI: No PI
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Port-1 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++Virtual Drive: 2 (Target Id: 2)
++Name                :
++RAID Level          : Primary-0, Secondary-0, RAID Level Qualifier-0
++Size                : 1.089 TB
++Sector Size         : 512
++Is VD emulated      : No
++Parity Size         : 0
++State               : Optimal
++Strip Size          : 256 KB
++Number Of Drives    : 2
++Span Depth          : 1
++Default Cache Policy: WriteBack, ReadAdaptive, Direct, No Write Cache if Bad BBU
++Current Cache Policy: WriteThrough, ReadAdaptive, Direct, No Write Cache if Bad BBU
++Default Access Policy: Read/Write
++Current Access Policy: Read/Write
++Disk Cache Policy   : Disk's Default
++Encryption Type     : None
++PI type: No PI
++
++Is VD Cached: No
++Number of Spans: 1
++Span: 0 - Number of PDs: 2
++
++PD: 0 Information
++Enclosure Device ID: 252
++Slot Number: 2
++Drive's position: DiskGroup: 2, Span: 0, Arm: 0
++Enclosure position: N/A
++Device Id: 9
++WWN: 5000C50088108B18
++Sequence Number: 6
++Media Error Count: 0
++Other Error Count: 0
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SAS
++
++Raw Size: 558.911 GB [0x45dd2fb0 Sectors]
++Non Coerced Size: 558.411 GB [0x45cd2fb0 Sectors]
++Coerced Size: 558.406 GB [0x45cd0000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  512
++Firmware state: Online, Spun Up
++Commissioned Spare : No
++Emergency Spare : No
++Device Firmware Level: 000B
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x5000c50088108b19
++SAS Address(1): 0x0
++Connected Port Number: 2(path0) 
++Inquiry Data: SEAGATE ST3600057SS     000B6SL9Y2MX            
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None 
++Device Speed: 6.0Gb/s 
++Link Speed: 6.0Gb/s 
++Media Type: Hard Disk Device
++Drive:  Not Certified
++Drive Temperature :48C (118.40 F)
++PI Eligibility:  No 
++Drive is formatted for PI information:  No
++PI: No PI
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Port-1 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++
++PD: 1 Information
++Enclosure Device ID: 252
++Slot Number: 3
++Drive's position: DiskGroup: 2, Span: 0, Arm: 1
++Enclosure position: N/A
++Device Id: 12
++WWN: 5000C5007F9F6BB0
++Sequence Number: 6
++Media Error Count: 0
++Other Error Count: 0
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SAS
++
++Raw Size: 558.911 GB [0x45dd2fb0 Sectors]
++Non Coerced Size: 558.411 GB [0x45cd2fb0 Sectors]
++Coerced Size: 558.406 GB [0x45cd0000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  512
++Firmware state: Online, Spun Up
++Commissioned Spare : No
++Emergency Spare : No
++Device Firmware Level: 000B
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x5000c5007f9f6bb1
++SAS Address(1): 0x0
++Connected Port Number: 3(path0) 
++Inquiry Data: SEAGATE ST3600057SS     000B6SL9XPWZ            
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None 
++Device Speed: 6.0Gb/s 
++Link Speed: 6.0Gb/s 
++Media Type: Hard Disk Device
++Drive:  Not Certified
++Drive Temperature :46C (114.80 F)
++PI Eligibility:  No 
++Drive is formatted for PI information:  No
++PI: No PI
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Port-1 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++
++Exit Code: 0x00
+diff --git a/ironic_lib/tests/examples/megacli_cmd_outputs/megacli_ldpdinfo_raid10.txt b/ironic_lib/tests/examples/megacli_cmd_outputs/megacli_ldpdinfo_raid10.txt
+new file mode 100644
+index 0000000..816508f
+--- /dev/null
++++ b/ironic_lib/tests/examples/megacli_cmd_outputs/megacli_ldpdinfo_raid10.txt
+@@ -0,0 +1,250 @@
++
++Adapter #0
++
++Number of Virtual Disks: 1
++Virtual Drive: 0 (Target Id: 0)
++Name                :
++RAID Level          : Primary-1, Secondary-0, RAID Level Qualifier-0
++Size                : 1.089 TB
++Sector Size         : 512
++Is VD emulated      : No
++Mirror Data         : 1.089 TB
++State               : Optimal
++Strip Size          : 256 KB
++Number Of Drives per span:2
++Span Depth          : 2
++Default Cache Policy: WriteBack, ReadAdaptive, Direct, No Write Cache if Bad BBU
++Current Cache Policy: WriteThrough, ReadAdaptive, Direct, No Write Cache if Bad BBU
++Default Access Policy: Read/Write
++Current Access Policy: Read/Write
++Disk Cache Policy   : Disk's Default
++Encryption Type     : None
++PI type: No PI
++
++Is VD Cached: No
++Number of Spans: 2
++Span: 0 - Number of PDs: 2
++
++PD: 0 Information
++Enclosure Device ID: 252
++Slot Number: 0
++Drive's position: DiskGroup: 0, Span: 0, Arm: 0
++Enclosure position: N/A
++Device Id: 11
++WWN: 5000C5008809C900
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 0
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SAS
++
++Raw Size: 558.911 GB [0x45dd2fb0 Sectors]
++Non Coerced Size: 558.411 GB [0x45cd2fb0 Sectors]
++Coerced Size: 558.406 GB [0x45cd0000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  512
++Firmware state: Online, Spun Up
++Commissioned Spare : No
++Emergency Spare : No
++Device Firmware Level: 000B
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x5000c5008809c901
++SAS Address(1): 0x0
++Connected Port Number: 0(path0)
++Inquiry Data: SEAGATE ST3600057SS     000B6SL9W65G
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None
++Device Speed: 6.0Gb/s
++Link Speed: 6.0Gb/s
++Media Type: Hard Disk Device
++Drive:  Not Certified
++Drive Temperature :42C (107.60 F)
++PI Eligibility:  No
++Drive is formatted for PI information:  No
++PI: No PI
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s
++Port-1 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++
++PD: 1 Information
++Enclosure Device ID: 252
++Slot Number: 1
++Drive's position: DiskGroup: 0, Span: 0, Arm: 1
++Enclosure position: N/A
++Device Id: 8
++WWN: 5000C5007F9F69F8
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 0
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SAS
++
++Raw Size: 558.911 GB [0x45dd2fb0 Sectors]
++Non Coerced Size: 558.411 GB [0x45cd2fb0 Sectors]
++Coerced Size: 558.406 GB [0x45cd0000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  512
++Firmware state: Online, Spun Up
++Commissioned Spare : No
++Emergency Spare : No
++Device Firmware Level: 000B
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x5000c5007f9f69f9
++SAS Address(1): 0x0
++Connected Port Number: 1(path0)
++Inquiry Data: SEAGATE ST3600057SS     000B6SL9XPY2
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None
++Device Speed: 6.0Gb/s
++Link Speed: 6.0Gb/s
++Media Type: Hard Disk Device
++Drive:  Not Certified
++Drive Temperature :41C (105.80 F)
++PI Eligibility:  No
++Drive is formatted for PI information:  No
++PI: No PI
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s
++Port-1 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++Span: 1 - Number of PDs: 2
++
++PD: 0 Information
++Enclosure Device ID: 252
++Slot Number: 2
++Drive's position: DiskGroup: 0, Span: 1, Arm: 0
++Enclosure position: N/A
++Device Id: 9
++WWN: 5000C50088108B18
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 0
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SAS
++
++Raw Size: 558.911 GB [0x45dd2fb0 Sectors]
++Non Coerced Size: 558.411 GB [0x45cd2fb0 Sectors]
++Coerced Size: 558.406 GB [0x45cd0000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  512
++Firmware state: Online, Spun Up
++Commissioned Spare : No
++Emergency Spare : No
++Device Firmware Level: 000B
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x5000c50088108b19
++SAS Address(1): 0x0
++Connected Port Number: 2(path0)
++Inquiry Data: SEAGATE ST3600057SS     000B6SL9Y2MX
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None
++Device Speed: 6.0Gb/s
++Link Speed: 6.0Gb/s
++Media Type: Hard Disk Device
++Drive:  Not Certified
++Drive Temperature :42C (107.60 F)
++PI Eligibility:  No
++Drive is formatted for PI information:  No
++PI: No PI
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s
++Port-1 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++
++PD: 1 Information
++Enclosure Device ID: 252
++Slot Number: 3
++Drive's position: DiskGroup: 0, Span: 1, Arm: 1
++Enclosure position: N/A
++Device Id: 12
++WWN: 5000C5007F9F6BB0
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 0
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SAS
++
++Raw Size: 558.911 GB [0x45dd2fb0 Sectors]
++Non Coerced Size: 558.411 GB [0x45cd2fb0 Sectors]
++Coerced Size: 558.406 GB [0x45cd0000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  512
++Firmware state: Online, Spun Up
++Commissioned Spare : No
++Emergency Spare : No
++Device Firmware Level: 000B
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x5000c5007f9f6bb1
++SAS Address(1): 0x0
++Connected Port Number: 3(path0)
++Inquiry Data: SEAGATE ST3600057SS     000B6SL9XPWZ
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None
++Device Speed: 6.0Gb/s
++Link Speed: 6.0Gb/s
++Media Type: Hard Disk Device
++Drive:  Not Certified
++Drive Temperature :41C (105.80 F)
++PI Eligibility:  No
++Drive is formatted for PI information:  No
++PI: No PI
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s
++Port-1 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++
++Exit Code: 0x00
++
+diff --git a/ironic_lib/tests/examples/megacli_cmd_outputs/megacli_output.txt b/ironic_lib/tests/examples/megacli_cmd_outputs/megacli_output.txt
+new file mode 100644
+index 0000000..39b29ff
+--- /dev/null
++++ b/ironic_lib/tests/examples/megacli_cmd_outputs/megacli_output.txt
+@@ -0,0 +1,187 @@
++Adapter #0
++
++Enclosure Device ID: 32
++Slot Number: 9
++Enclosure position: 1
++Device Id: 9
++WWN: 55cd2e404c02b114
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 121
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SATA
++
++Raw Size: 223.570 GB [0x1bf244b0 Sectors]
++Non Coerced Size: 223.070 GB [0x1be244b0 Sectors]
++Coerced Size: 223.0 GB [0x1be00000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  4096
++Firmware state: Unconfigured(good), Spun Up
++Device Firmware Level: 0130
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x500056b31234abc9
++Connected Port Number: 0(path0)
++Inquiry Data: BTWA520306AN240AGN  INTEL SSDSC2BB240G6                     G2010130
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None
++Device Speed: 6.0Gb/s
++Link Speed: 6.0Gb/s
++Media Type: Solid State Device
++Drive:  Not Certified
++Drive Temperature :21C (69.80 F)
++PI Eligibility:  No
++Drive is formatted for PI information:  No
++PI: No PI
++Drive's NCQ setting : N/A
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++Enclosure Device ID: 32
++Slot Number: 10
++Enclosure position: 1
++Device Id: 10
++WWN: 55cd2e404c02b181
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 85
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SATA
++
++Raw Size: 223.570 GB [0x1bf244b0 Sectors]
++Non Coerced Size: 223.070 GB [0x1be244b0 Sectors]
++Coerced Size: 223.0 GB [0x1be00000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  4096
++Firmware state: Unconfigured(good), Spun Up
++Device Firmware Level: 0130
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x500056b31234abca
++Connected Port Number: 0(path0)
++Inquiry Data: BTWA520306DV240AGN  INTEL SSDSC2BB240G6                     G2010130
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None
++Device Speed: 6.0Gb/s
++Link Speed: 6.0Gb/s
++Media Type: Solid State Device
++Drive:  Not Certified
++Drive Temperature :22C (71.60 F)
++PI Eligibility:  No
++Drive is formatted for PI information:  No
++PI: No PI
++Drive's NCQ setting : N/A
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++Enclosure Device ID: 32
++Slot Number: 12
++Enclosure position: 1
++Device Id: 9
++WWN: 55cd2e404c02b232
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 121
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SATA
++
++Raw Size: 223.570 GB [0x1bf244b0 Sectors]
++Non Coerced Size: 223.070 GB [0x1be244b0 Sectors]
++Coerced Size: 223.0 GB [0x1be00000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  4096
++Firmware state: Unconfigured(good), Spun Up
++Device Firmware Level: 0130
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x500056b31234abc9
++Connected Port Number: 0(path0)
++Inquiry Data: BTWA520306AN240AGN  INTEL SSDSC2BB240G6                     G2010130
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None
++Device Speed: 6.0Gb/s
++Link Speed: 6.0Gb/s
++Media Type: Solid State Device
++Drive:  Not Certified
++Drive Temperature :21C (69.80 F)
++PI Eligibility:  No
++Drive is formatted for PI information:  No
++PI: No PI
++Drive's NCQ setting : N/A
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++Enclosure Device ID: 32
++Slot Number: 18
++Enclosure position: 1
++Device Id: 10
++WWN: 55cd80f12302b181
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 85
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SATA
++
++Raw Size: 223.570 GB [0x1bf244b0 Sectors]
++Non Coerced Size: 223.070 GB [0x1be244b0 Sectors]
++Coerced Size: 223.0 GB [0x1be00000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  4096
++Firmware state: Unconfigured(good), Spun Up
++Device Firmware Level: 0130
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x500056b31234abca
++Connected Port Number: 0(path0)
++Inquiry Data: BTWA520306DV240AGN  INTEL SSDSC2BB240G6                     G2010130
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None
++Device Speed: 6.0Gb/s
++Link Speed: 6.0Gb/s
++Media Type: Solid State Device
++Drive:  Not Certified
++Drive Temperature :22C (71.60 F)
++PI Eligibility:  No
++Drive is formatted for PI information:  No
++PI: No PI
++Drive's NCQ setting : N/A
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s
++Drive has flagged a S.M.A.R.T alert : No
+diff --git a/ironic_lib/tests/examples/megacli_cmd_outputs/megacli_pdinfo_jbod_output.txt b/ironic_lib/tests/examples/megacli_cmd_outputs/megacli_pdinfo_jbod_output.txt
+new file mode 100644
+index 0000000..8640150
+--- /dev/null
++++ b/ironic_lib/tests/examples/megacli_cmd_outputs/megacli_pdinfo_jbod_output.txt
+@@ -0,0 +1,50 @@
++
++Enclosure Device ID: 32
++Slot Number: 22
++Enclosure position: 1
++Device Id: 22
++WWN: 55cd2e404c03588c
++Sequence Number: 14
++Media Error Count: 0
++Other Error Count: 7
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SATA
++
++Raw Size: 223.570 GB [0x1bf244b0 Sectors]
++Non Coerced Size: 223.070 GB [0x1be244b0 Sectors]
++Coerced Size: 223.0 GB [0x1be00000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  4096
++Firmware state: JBOD
++Device Firmware Level: 0130
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x500056b31234abd6
++Connected Port Number: 0(path0)
++Inquiry Data: BTWA521405BQ240AGN  INTEL SSDSC2BB240G6                     G2010130
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None
++Device Speed: 6.0Gb/s
++Link Speed: 6.0Gb/s
++Media Type: Solid State Device
++Drive:  Not Certified
++Drive Temperature :24C (75.20 F)
++PI Eligibility:  No
++Drive is formatted for PI information:  No
++PI: No PI
++Drive's NCQ setting : N/A
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++
++Exit Code: 0x00
+diff --git a/ironic_lib/tests/examples/megacli_cmd_outputs/megacli_pdinfo_unconfigured_output.txt b/ironic_lib/tests/examples/megacli_cmd_outputs/megacli_pdinfo_unconfigured_output.txt
+new file mode 100644
+index 0000000..dc9132b
+--- /dev/null
++++ b/ironic_lib/tests/examples/megacli_cmd_outputs/megacli_pdinfo_unconfigured_output.txt
+@@ -0,0 +1,50 @@
++                                                                                                                                                                                              
++Enclosure Device ID: 32
++Slot Number: 22
++Enclosure position: 1
++Device Id: 22
++WWN: 55cd2e404c03588c
++Sequence Number: 15
++Media Error Count: 0
++Other Error Count: 8
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SATA
++
++Raw Size: 223.570 GB [0x1bf244b0 Sectors]
++Non Coerced Size: 223.070 GB [0x1be244b0 Sectors]
++Coerced Size: 223.0 GB [0x1be00000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  4096
++Firmware state: Unconfigured(good), Spun Up
++Device Firmware Level: 0130
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x500056b31234abd6
++Connected Port Number: 0(path0) 
++Inquiry Data: BTWA521405BQ240AGN  INTEL SSDSC2BB240G6                     G2010130
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None 
++Device Speed: 6.0Gb/s 
++Link Speed: 6.0Gb/s 
++Media Type: Solid State Device
++Drive:  Not Certified
++Drive Temperature :24C (75.20 F)
++PI Eligibility:  No 
++Drive is formatted for PI information:  No
++PI: No PI
++Drive's NCQ setting : N/A
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++
++Exit Code: 0x00
+diff --git a/ironic_lib/tests/examples/megacli_cmd_outputs/megacli_real_output.txt b/ironic_lib/tests/examples/megacli_cmd_outputs/megacli_real_output.txt
+new file mode 100644
+index 0000000..bf426ef
+--- /dev/null
++++ b/ironic_lib/tests/examples/megacli_cmd_outputs/megacli_real_output.txt
+@@ -0,0 +1,1142 @@
++                                     
++Adapter #0
++
++Enclosure Device ID: 32
++Slot Number: 0
++Drive's position: DiskGroup: 1, Span: 0, Arm: 0
++Enclosure position: 1
++Device Id: 0
++WWN: 55cd2e404c02bbe7
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 0
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SATA
++
++Raw Size: 223.570 GB [0x1bf244b0 Sectors]
++Non Coerced Size: 223.070 GB [0x1be244b0 Sectors]
++Coerced Size: 223.0 GB [0x1be00000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  4096
++Firmware state: Online, Spun Up
++Device Firmware Level: 0130
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x500056b31234abc0
++Connected Port Number: 0(path0) 
++Inquiry Data: BTWA520308TJ240AGN  INTEL SSDSC2BB240G6                     G2010130
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None 
++Device Speed: 6.0Gb/s 
++Link Speed: 6.0Gb/s 
++Media Type: Solid State Device
++Drive:  Not Certified
++Drive Temperature :22C (71.60 F)
++PI Eligibility:  No 
++Drive is formatted for PI information:  No
++PI: No PI
++Drive's NCQ setting : N/A
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++Enclosure Device ID: 32
++Slot Number: 1
++Drive's position: DiskGroup: 0, Span: 0, Arm: 0
++Enclosure position: 1
++Device Id: 1
++WWN: 55cd2e404c02bbf2
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 0
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SATA
++
++Raw Size: 223.570 GB [0x1bf244b0 Sectors]
++Non Coerced Size: 223.070 GB [0x1be244b0 Sectors]
++Coerced Size: 223.0 GB [0x1be00000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  4096
++Firmware state: Online, Spun Up
++Device Firmware Level: 0130
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x500056b31234abc1
++Connected Port Number: 0(path0) 
++Inquiry Data: BTWA520308TX240AGN  INTEL SSDSC2BB240G6                     G2010130
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None 
++Device Speed: 6.0Gb/s 
++Link Speed: 6.0Gb/s 
++Media Type: Solid State Device
++Drive:  Not Certified
++Drive Temperature :22C (71.60 F)
++PI Eligibility:  No 
++Drive is formatted for PI information:  No
++PI: No PI
++Drive's NCQ setting : N/A
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++Enclosure Device ID: 32
++Slot Number: 2
++Drive's position: DiskGroup: 0, Span: 0, Arm: 1
++Enclosure position: 1
++Device Id: 2
++WWN: 55cd2e404c02b0a7
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 0
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SATA
++
++Raw Size: 223.570 GB [0x1bf244b0 Sectors]
++Non Coerced Size: 223.070 GB [0x1be244b0 Sectors]
++Coerced Size: 223.0 GB [0x1be00000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  4096
++Firmware state: Online, Spun Up
++Device Firmware Level: 0130
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x500056b31234abc2
++Connected Port Number: 0(path0) 
++Inquiry Data: BTWA5203067C240AGN  INTEL SSDSC2BB240G6                     G2010130
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None 
++Device Speed: 6.0Gb/s 
++Link Speed: 6.0Gb/s 
++Media Type: Solid State Device
++Drive:  Not Certified
++Drive Temperature :21C (69.80 F)
++PI Eligibility:  No 
++Drive is formatted for PI information:  No
++PI: No PI
++Drive's NCQ setting : N/A
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++Enclosure Device ID: 32
++Slot Number: 3
++Drive's position: DiskGroup: 1, Span: 0, Arm: 1
++Enclosure position: 1
++Device Id: 3
++WWN: 55cd2e404c035a20
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 0
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SATA
++
++Raw Size: 223.570 GB [0x1bf244b0 Sectors]
++Non Coerced Size: 223.070 GB [0x1be244b0 Sectors]
++Coerced Size: 223.0 GB [0x1be00000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  4096
++Firmware state: Online, Spun Up
++Device Firmware Level: 0130
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x500056b31234abc3
++Connected Port Number: 0(path0) 
++Inquiry Data: BTWA521405SG240AGN  INTEL SSDSC2BB240G6                     G2010130
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None 
++Device Speed: 6.0Gb/s 
++Link Speed: 6.0Gb/s 
++Media Type: Solid State Device
++Drive:  Not Certified
++Drive Temperature :21C (69.80 F)
++PI Eligibility:  No 
++Drive is formatted for PI information:  No
++PI: No PI
++Drive's NCQ setting : N/A
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++Enclosure Device ID: 32
++Slot Number: 4
++Drive's position: DiskGroup: 1, Span: 0, Arm: 2
++Enclosure position: 1
++Device Id: 4
++WWN: 55cd2e404c035434
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 0
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SATA
++
++Raw Size: 223.570 GB [0x1bf244b0 Sectors]
++Non Coerced Size: 223.070 GB [0x1be244b0 Sectors]
++Coerced Size: 223.0 GB [0x1be00000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  4096
++Firmware state: Online, Spun Up
++Device Firmware Level: 0130
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x500056b31234abc4
++Connected Port Number: 0(path0) 
++Inquiry Data: BTWA5214044V240AGN  INTEL SSDSC2BB240G6                     G2010130
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None 
++Device Speed: 6.0Gb/s 
++Link Speed: 6.0Gb/s 
++Media Type: Solid State Device
++Drive:  Not Certified
++Drive Temperature :21C (69.80 F)
++PI Eligibility:  No 
++Drive is formatted for PI information:  No
++PI: No PI
++Drive's NCQ setting : N/A
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++Enclosure Device ID: 32
++Slot Number: 5
++Drive's position: DiskGroup: 1, Span: 0, Arm: 3
++Enclosure position: 1
++Device Id: 5
++WWN: 55cd2e404c02b162
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 0
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SATA
++
++Raw Size: 223.570 GB [0x1bf244b0 Sectors]
++Non Coerced Size: 223.070 GB [0x1be244b0 Sectors]
++Coerced Size: 223.0 GB [0x1be00000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  4096
++Firmware state: Online, Spun Up
++Device Firmware Level: 0130
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x500056b31234abc5
++Connected Port Number: 0(path0) 
++Inquiry Data: BTWA520306CY240AGN  INTEL SSDSC2BB240G6                     G2010130
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None 
++Device Speed: 6.0Gb/s 
++Link Speed: 6.0Gb/s 
++Media Type: Solid State Device
++Drive:  Not Certified
++Drive Temperature :21C (69.80 F)
++PI Eligibility:  No 
++Drive is formatted for PI information:  No
++PI: No PI
++Drive's NCQ setting : N/A
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++Enclosure Device ID: 32
++Slot Number: 6
++Drive's position: DiskGroup: 2, Span: 0, Arm: 0
++Enclosure position: 1
++Device Id: 6
++WWN: 55cd2e404c0356a6
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 0
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SATA
++
++Raw Size: 223.570 GB [0x1bf244b0 Sectors]
++Non Coerced Size: 223.070 GB [0x1be244b0 Sectors]
++Coerced Size: 223.0 GB [0x1be00000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  4096
++Firmware state: Online, Spun Up
++Device Firmware Level: 0130
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x500056b31234abc6
++Connected Port Number: 0(path0) 
++Inquiry Data: BTWA521404UP240AGN  INTEL SSDSC2BB240G6                     G2010130
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None 
++Device Speed: 6.0Gb/s 
++Link Speed: 6.0Gb/s 
++Media Type: Solid State Device
++Drive:  Not Certified
++Drive Temperature :21C (69.80 F)
++PI Eligibility:  No 
++Drive is formatted for PI information:  No
++PI: No PI
++Drive's NCQ setting : N/A
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++Enclosure Device ID: 32
++Slot Number: 7
++Drive's position: DiskGroup: 2, Span: 0, Arm: 1
++Enclosure position: 1
++Device Id: 7
++WWN: 55cd2e404c02b1a3
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 0
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SATA
++
++Raw Size: 223.570 GB [0x1bf244b0 Sectors]
++Non Coerced Size: 223.070 GB [0x1be244b0 Sectors]
++Coerced Size: 223.0 GB [0x1be00000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  4096
++Firmware state: Online, Spun Up
++Device Firmware Level: 0130
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x500056b31234abc7
++Connected Port Number: 0(path0) 
++Inquiry Data: BTWA520306EV240AGN  INTEL SSDSC2BB240G6                     G2010130
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None 
++Device Speed: 6.0Gb/s 
++Link Speed: 6.0Gb/s 
++Media Type: Solid State Device
++Drive:  Not Certified
++Drive Temperature :22C (71.60 F)
++PI Eligibility:  No 
++Drive is formatted for PI information:  No
++PI: No PI
++Drive's NCQ setting : N/A
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++Enclosure Device ID: 32
++Slot Number: 8
++Drive's position: DiskGroup: 2, Span: 0, Arm: 2
++Enclosure position: 1
++Device Id: 8
++WWN: 55cd2e404c02b252
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 0
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SATA
++
++Raw Size: 223.570 GB [0x1bf244b0 Sectors]
++Non Coerced Size: 223.070 GB [0x1be244b0 Sectors]
++Coerced Size: 223.0 GB [0x1be00000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  4096
++Firmware state: Online, Spun Up
++Device Firmware Level: 0130
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x500056b31234abc8
++Connected Port Number: 0(path0) 
++Inquiry Data: BTWA520306L6240AGN  INTEL SSDSC2BB240G6                     G2010130
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None 
++Device Speed: 6.0Gb/s 
++Link Speed: 6.0Gb/s 
++Media Type: Solid State Device
++Drive:  Not Certified
++Drive Temperature :22C (71.60 F)
++PI Eligibility:  No 
++Drive is formatted for PI information:  No
++PI: No PI
++Drive's NCQ setting : N/A
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++Enclosure Device ID: 32
++Slot Number: 9
++Enclosure position: 1
++Device Id: 9
++WWN: 55cd2e404c02b114
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 11
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SATA
++
++Raw Size: 223.570 GB [0x1bf244b0 Sectors]
++Non Coerced Size: 223.070 GB [0x1be244b0 Sectors]
++Coerced Size: 223.0 GB [0x1be00000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  4096
++Firmware state: JBOD
++Device Firmware Level: 0130
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x500056b31234abc9
++Connected Port Number: 0(path0) 
++Inquiry Data: BTWA520306AN240AGN  INTEL SSDSC2BB240G6                     G2010130
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None 
++Device Speed: 6.0Gb/s 
++Link Speed: 6.0Gb/s 
++Media Type: Solid State Device
++Drive:  Not Certified
++Drive Temperature :21C (69.80 F)
++PI Eligibility:  No 
++Drive is formatted for PI information:  No
++PI: No PI
++Drive's NCQ setting : N/A
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++Enclosure Device ID: 32
++Slot Number: 10
++Enclosure position: 1
++Device Id: 10
++WWN: 55cd2e404c02b181
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 2
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SATA
++
++Raw Size: 223.570 GB [0x1bf244b0 Sectors]
++Non Coerced Size: 223.070 GB [0x1be244b0 Sectors]
++Coerced Size: 223.0 GB [0x1be00000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  4096
++Firmware state: JBOD
++Device Firmware Level: 0130
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x500056b31234abca
++Connected Port Number: 0(path0) 
++Inquiry Data: BTWA520306DV240AGN  INTEL SSDSC2BB240G6                     G2010130
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None 
++Device Speed: 6.0Gb/s 
++Link Speed: 6.0Gb/s 
++Media Type: Solid State Device
++Drive:  Not Certified
++Drive Temperature :21C (69.80 F)
++PI Eligibility:  No 
++Drive is formatted for PI information:  No
++PI: No PI
++Drive's NCQ setting : N/A
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++Enclosure Device ID: 32
++Slot Number: 11
++Enclosure position: 1
++Device Id: 11
++WWN: 55cd2e404c0358b7
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 2
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SATA
++
++Raw Size: 223.570 GB [0x1bf244b0 Sectors]
++Non Coerced Size: 223.070 GB [0x1be244b0 Sectors]
++Coerced Size: 223.0 GB [0x1be00000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  4096
++Firmware state: JBOD
++Device Firmware Level: 0130
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x500056b31234abcb
++Connected Port Number: 0(path0) 
++Inquiry Data: BTWA521405DL240AGN  INTEL SSDSC2BB240G6                     G2010130
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None 
++Device Speed: 6.0Gb/s 
++Link Speed: 6.0Gb/s 
++Media Type: Solid State Device
++Drive:  Not Certified
++Drive Temperature :22C (71.60 F)
++PI Eligibility:  No 
++Drive is formatted for PI information:  No
++PI: No PI
++Drive's NCQ setting : N/A
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++Enclosure Device ID: 32
++Slot Number: 12
++Enclosure position: 1
++Device Id: 12
++WWN: 55cd2e404c02b1e8
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 2
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SATA
++
++Raw Size: 223.570 GB [0x1bf244b0 Sectors]
++Non Coerced Size: 223.070 GB [0x1be244b0 Sectors]
++Coerced Size: 223.0 GB [0x1be00000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  4096
++Firmware state: JBOD
++Device Firmware Level: 0130
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x500056b31234abcc
++Connected Port Number: 0(path0) 
++Inquiry Data: BTWA520306GW240AGN  INTEL SSDSC2BB240G6                     G2010130
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None 
++Device Speed: 6.0Gb/s 
++Link Speed: 6.0Gb/s 
++Media Type: Solid State Device
++Drive:  Not Certified
++Drive Temperature :22C (71.60 F)
++PI Eligibility:  No 
++Drive is formatted for PI information:  No
++PI: No PI
++Drive's NCQ setting : N/A
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++Enclosure Device ID: 32
++Slot Number: 13
++Enclosure position: 1
++Device Id: 13
++WWN: 55cd2e404c02bac5
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 2
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SATA
++
++Raw Size: 223.570 GB [0x1bf244b0 Sectors]
++Non Coerced Size: 223.070 GB [0x1be244b0 Sectors]
++Coerced Size: 223.0 GB [0x1be00000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  4096
++Firmware state: JBOD
++Device Firmware Level: 0130
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x500056b31234abcd
++Connected Port Number: 0(path0) 
++Inquiry Data: BTWA520308JK240AGN  INTEL SSDSC2BB240G6                     G2010130
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None 
++Device Speed: 6.0Gb/s 
++Link Speed: 6.0Gb/s 
++Media Type: Solid State Device
++Drive:  Not Certified
++Drive Temperature :22C (71.60 F)
++PI Eligibility:  No 
++Drive is formatted for PI information:  No
++PI: No PI
++Drive's NCQ setting : N/A
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++Enclosure Device ID: 32
++Slot Number: 14
++Enclosure position: 1
++Device Id: 14
++WWN: 55cd2e404c02b1ee
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 2
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SATA
++
++Raw Size: 223.570 GB [0x1bf244b0 Sectors]
++Non Coerced Size: 223.070 GB [0x1be244b0 Sectors]
++Coerced Size: 223.0 GB [0x1be00000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  4096
++Firmware state: JBOD
++Device Firmware Level: 0130
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x500056b31234abce
++Connected Port Number: 0(path0) 
++Inquiry Data: BTWA520306H2240AGN  INTEL SSDSC2BB240G6                     G2010130
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None 
++Device Speed: 6.0Gb/s 
++Link Speed: 6.0Gb/s 
++Media Type: Solid State Device
++Drive:  Not Certified
++Drive Temperature :22C (71.60 F)
++PI Eligibility:  No 
++Drive is formatted for PI information:  No
++PI: No PI
++Drive's NCQ setting : N/A
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++Enclosure Device ID: 32
++Slot Number: 15
++Enclosure position: 1
++Device Id: 15
++WWN: 55cd2e404c02b1d5
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 2
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SATA
++
++Raw Size: 223.570 GB [0x1bf244b0 Sectors]
++Non Coerced Size: 223.070 GB [0x1be244b0 Sectors]
++Coerced Size: 223.0 GB [0x1be00000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  4096
++Firmware state: JBOD
++Device Firmware Level: 0130
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x500056b31234abcf
++Connected Port Number: 0(path0) 
++Inquiry Data: BTWA520306GB240AGN  INTEL SSDSC2BB240G6                     G2010130
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None 
++Device Speed: 6.0Gb/s 
++Link Speed: 6.0Gb/s 
++Media Type: Solid State Device
++Drive:  Not Certified
++Drive Temperature :21C (69.80 F)
++PI Eligibility:  No 
++Drive is formatted for PI information:  No
++PI: No PI
++Drive's NCQ setting : N/A
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++Enclosure Device ID: 32
++Slot Number: 16
++Enclosure position: 1
++Device Id: 16
++WWN: 55cd2e404c02b197
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 2
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SATA
++
++Raw Size: 223.570 GB [0x1bf244b0 Sectors]
++Non Coerced Size: 223.070 GB [0x1be244b0 Sectors]
++Coerced Size: 223.0 GB [0x1be00000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  4096
++Firmware state: JBOD
++Device Firmware Level: 0130
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x500056b31234abd0
++Connected Port Number: 0(path0) 
++Inquiry Data: BTWA520306EH240AGN  INTEL SSDSC2BB240G6                     G2010130
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None 
++Device Speed: 6.0Gb/s 
++Link Speed: 6.0Gb/s 
++Media Type: Solid State Device
++Drive:  Not Certified
++Drive Temperature :21C (69.80 F)
++PI Eligibility:  No 
++Drive is formatted for PI information:  No
++PI: No PI
++Drive's NCQ setting : N/A
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++Enclosure Device ID: 32
++Slot Number: 17
++Enclosure position: 1
++Device Id: 17
++WWN: 55cd2e404c02b1ea
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 2
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SATA
++
++Raw Size: 223.570 GB [0x1bf244b0 Sectors]
++Non Coerced Size: 223.070 GB [0x1be244b0 Sectors]
++Coerced Size: 223.0 GB [0x1be00000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  4096
++Firmware state: JBOD
++Device Firmware Level: 0130
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x500056b31234abd1
++Connected Port Number: 0(path0) 
++Inquiry Data: BTWA520306GY240AGN  INTEL SSDSC2BB240G6                     G2010130
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None 
++Device Speed: 6.0Gb/s 
++Link Speed: 6.0Gb/s 
++Media Type: Solid State Device
++Drive:  Not Certified
++Drive Temperature :21C (69.80 F)
++PI Eligibility:  No 
++Drive is formatted for PI information:  No
++PI: No PI
++Drive's NCQ setting : N/A
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++Enclosure Device ID: 32
++Slot Number: 18
++Enclosure position: 1
++Device Id: 18
++WWN: 55cd2e404c02bbd2
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 2
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SATA
++
++Raw Size: 223.570 GB [0x1bf244b0 Sectors]
++Non Coerced Size: 223.070 GB [0x1be244b0 Sectors]
++Coerced Size: 223.0 GB [0x1be00000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  4096
++Firmware state: JBOD
++Device Firmware Level: 0130
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x500056b31234abd2
++Connected Port Number: 0(path0) 
++Inquiry Data: BTWA520308SV240AGN  INTEL SSDSC2BB240G6                     G2010130
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None 
++Device Speed: 6.0Gb/s 
++Link Speed: 6.0Gb/s 
++Media Type: Solid State Device
++Drive:  Not Certified
++Drive Temperature :21C (69.80 F)
++PI Eligibility:  No 
++Drive is formatted for PI information:  No
++PI: No PI
++Drive's NCQ setting : N/A
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++Enclosure Device ID: 32
++Slot Number: 19
++Enclosure position: 1
++Device Id: 19
++WWN: 55cd2e404c02b191
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 2
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SATA
++
++Raw Size: 223.570 GB [0x1bf244b0 Sectors]
++Non Coerced Size: 223.070 GB [0x1be244b0 Sectors]
++Coerced Size: 223.0 GB [0x1be00000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  4096
++Firmware state: JBOD
++Device Firmware Level: 0130
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x500056b31234abd3
++Connected Port Number: 0(path0) 
++Inquiry Data: BTWA520306EB240AGN  INTEL SSDSC2BB240G6                     G2010130
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None 
++Device Speed: 6.0Gb/s 
++Link Speed: 6.0Gb/s 
++Media Type: Solid State Device
++Drive:  Not Certified
++Drive Temperature :22C (71.60 F)
++PI Eligibility:  No 
++Drive is formatted for PI information:  No
++PI: No PI
++Drive's NCQ setting : N/A
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++Enclosure Device ID: 32
++Slot Number: 20
++Enclosure position: 1
++Device Id: 20
++WWN: 55cd2e404c02bbb1
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 2
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SATA
++
++Raw Size: 223.570 GB [0x1bf244b0 Sectors]
++Non Coerced Size: 223.070 GB [0x1be244b0 Sectors]
++Coerced Size: 223.0 GB [0x1be00000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  4096
++Firmware state: JBOD
++Device Firmware Level: 0130
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x500056b31234abd4
++Connected Port Number: 0(path0) 
++Inquiry Data: BTWA520308RW240AGN  INTEL SSDSC2BB240G6                     G2010130
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None 
++Device Speed: 6.0Gb/s 
++Link Speed: 6.0Gb/s 
++Media Type: Solid State Device
++Drive:  Not Certified
++Drive Temperature :21C (69.80 F)
++PI Eligibility:  No 
++Drive is formatted for PI information:  No
++PI: No PI
++Drive's NCQ setting : N/A
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++Enclosure Device ID: 32
++Slot Number: 21
++Enclosure position: 1
++Device Id: 21
++WWN: 55cd2e404c035a61
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 2
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SATA
++
++Raw Size: 223.570 GB [0x1bf244b0 Sectors]
++Non Coerced Size: 223.070 GB [0x1be244b0 Sectors]
++Coerced Size: 223.0 GB [0x1be00000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  4096
++Firmware state: JBOD
++Device Firmware Level: 0130
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x500056b31234abd5
++Connected Port Number: 0(path0) 
++Inquiry Data: BTWA521405UH240AGN  INTEL SSDSC2BB240G6                     G2010130
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None 
++Device Speed: 6.0Gb/s 
++Link Speed: 6.0Gb/s 
++Media Type: Solid State Device
++Drive:  Not Certified
++Drive Temperature :21C (69.80 F)
++PI Eligibility:  No 
++Drive is formatted for PI information:  No
++PI: No PI
++Drive's NCQ setting : N/A
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++Enclosure Device ID: 32
++Slot Number: 22
++Enclosure position: 1
++Device Id: 22
++WWN: 55cd2e404c03588c
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 2
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SATA
++
++Raw Size: 223.570 GB [0x1bf244b0 Sectors]
++Non Coerced Size: 223.070 GB [0x1be244b0 Sectors]
++Coerced Size: 223.0 GB [0x1be00000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  4096
++Firmware state: JBOD
++Device Firmware Level: 0130
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x500056b31234abd6
++Connected Port Number: 0(path0) 
++Inquiry Data: BTWA521405BQ240AGN  INTEL SSDSC2BB240G6                     G2010130
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None 
++Device Speed: 6.0Gb/s 
++Link Speed: 6.0Gb/s 
++Media Type: Solid State Device
++Drive:  Not Certified
++Drive Temperature :21C (69.80 F)
++PI Eligibility:  No 
++Drive is formatted for PI information:  No
++PI: No PI
++Drive's NCQ setting : N/A
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++Enclosure Device ID: 32
++Slot Number: 23
++Enclosure position: 1
++Device Id: 23
++WWN: 55cd2e404c02bb54
++Sequence Number: 2
++Media Error Count: 0
++Other Error Count: 2
++Predictive Failure Count: 0
++Last Predictive Failure Event Seq Number: 0
++PD Type: SATA
++
++Raw Size: 223.570 GB [0x1bf244b0 Sectors]
++Non Coerced Size: 223.070 GB [0x1be244b0 Sectors]
++Coerced Size: 223.0 GB [0x1be00000 Sectors]
++Sector Size:  512
++Logical Sector Size:  512
++Physical Sector Size:  4096
++Firmware state: JBOD
++Device Firmware Level: 0130
++Shield Counter: 0
++Successful diagnostics completion on :  N/A
++SAS Address(0): 0x500056b31234abd7
++Connected Port Number: 0(path0) 
++Inquiry Data: BTWA520308P2240AGN  INTEL SSDSC2BB240G6                     G2010130
++FDE Capable: Not Capable
++FDE Enable: Disable
++Secured: Unsecured
++Locked: Unlocked
++Needs EKM Attention: No
++Foreign State: None 
++Device Speed: 6.0Gb/s 
++Link Speed: 6.0Gb/s 
++Media Type: Solid State Device
++Drive:  Not Certified
++Drive Temperature :22C (71.60 F)
++PI Eligibility:  No 
++Drive is formatted for PI information:  No
++PI: No PI
++Drive's NCQ setting : N/A
++Port-0 :
++Port status: Active
++Port's Linkspeed: 6.0Gb/s 
++Drive has flagged a S.M.A.R.T alert : No
++
++
++
++
++Exit Code: 0x00
+diff --git a/ironic_lib/tests/examples/megacli_cmd_outputs/udevadm_output.txt b/ironic_lib/tests/examples/megacli_cmd_outputs/udevadm_output.txt
+new file mode 100644
+index 0000000..c5b8ca2
+--- /dev/null
++++ b/ironic_lib/tests/examples/megacli_cmd_outputs/udevadm_output.txt
+@@ -0,0 +1,32 @@
++P: /devices/pci0000:00/0000:00:01.0/0000:02:00.0/host0/target0:2:0/0:2:0:0/block/sdb
++N: sdb
++S: disk/by-id/scsi-3644a84201ed45b0021fdb43490b2853a
++S: disk/by-id/wwn-0x644a84201ed45b0021fdb43490b2853a
++S: disk/by-path/pci-0000:02:00.0-scsi-0:2:0:0
++E: DEVLINKS=/dev/disk/by-path/pci-0000:02:00.0-scsi-0:2:0:0 /dev/disk/by-id/scsi-3644a84201ed45b0021fdb43490b2853a /dev/disk/by-id/wwn-0x644a84201ed45b0021fdb43490b2853a
++E: DEVNAME=/dev/sdb
++E: DEVPATH=/devices/pci0000:00/0000:00:01.0/0000:02:00.0/host0/target0:2:0/0:2:0:0/block/sdb
++E: DEVTYPE=disk
++E: ID_BUS=scsi
++E: ID_MODEL=PERC_H730_Mini
++E: ID_MODEL_ENC=PERC\x20H730\x20Mini\x20\x20
++E: ID_PART_TABLE_TYPE=dos
++E: ID_PART_TABLE_UUID=f59a20fd
++E: ID_PATH=pci-0000:02:00.0-scsi-0:2:0:0
++E: ID_PATH_TAG=pci-0000_02_00_0-scsi-0_2_0_0
++E: ID_REVISION=4.24
++E: ID_SCSI=1
++E: ID_SCSI_SERIAL=003a85b29034b4fd21005bd41e20844a
++E: ID_SERIAL=3644a84201ed45b0021fdb43490b2853a
++E: ID_SERIAL_SHORT=644a84201ed45b0021fdb43490b2853a
++E: ID_TYPE=disk
++E: ID_VENDOR=DELL
++E: ID_VENDOR_ENC=DELL\x20\x20\x20\x20
++E: ID_WWN=0x644a84201ed45b00
++E: ID_WWN_VENDOR_EXTENSION=0x21fdb43490b2853a
++E: ID_WWN_WITH_EXTENSION=0x644a84201ed45b0021fdb43490b2853a
++E: MAJOR=8
++E: MINOR=16
++E: SUBSYSTEM=block
++E: TAGS=:systemd:
++E: USEC_INITIALIZED=79540079037
+diff --git a/ironic_lib/tests/test_megacli.py b/ironic_lib/tests/test_megacli.py
+new file mode 100644
+index 0000000..39be10a
+--- /dev/null
++++ b/ironic_lib/tests/test_megacli.py
+@@ -0,0 +1,716 @@
++# Copyright (c) 2018 Intel Corporation
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++# implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import subprocess
++import unittest
++try:
++    from unittest import mock
++except ImportError:
++    import mock
++
++import yaml
++
++from ironic_lib.system_installer import exceptions
++from ironic_lib.system_installer import MegaCliSetup
++from ironic_lib.system_installer import PartitionSetup
++
++
++class MegaCliTest(unittest.TestCase):
++
++    @mock.patch('subprocess.check_call')
++    def setUp(self, call):
++        with open('ironic_lib/tests/examples/megacli.yml') as f:
++            conf = yaml.load(f)
++        self.megacli = MegaCliSetup(conf['disk_config'])
++
++    @mock.patch('os.path.isfile')
++    @mock.patch('subprocess.check_call')
++    def test_megacli_path_default_value(self, exe, isfile):
++        isfile.return_value = True
++        exe.side_effect = subprocess.CalledProcessError("1", "MegaCli64")
++        self.megacli._megacli_path_cached.cache_clear()
++        self.assertEqual(self.megacli._megacli_path,
++                         self.megacli.default_megacli_path)
++
++    @mock.patch('os.path.isfile')
++    @mock.patch('subprocess.check_call')
++    def test_megacli_path_in_path(self, exe, isfile):
++        isfile.return_value = True
++        self.megacli._megacli_path_cached.cache_clear()
++        self.assertEqual(self.megacli._megacli_path, 'MegaCli64')
++
++    @mock.patch('os.path.isfile')
++    @mock.patch('subprocess.check_call')
++    def test_megacli_path_fail(self, exe, file):
++        file.return_value = False
++        exe.side_effect = subprocess.CalledProcessError("1", "MegaCli64")
++        self.megacli._megacli_path_cached.cache_clear()
++        with self.assertRaises(exceptions.EnvError):
++            self.megacli._megacli_path
++
++    @mock.patch('subprocess.check_output')
++    def test_get_block_device_to_wwn(self, exe):
++        exe.return_value = ('{"blockdevices": [ {"name": "sda", '
++                            '"wwn": "0x55cd2e404c02b114"}, {"name": "sdb", '
++                            '"wwn": "0x55cd2e404c02b181"}]}')
++        self.assertEqual({'/dev/sda': '55cd2e404c02b114', '/dev/sdb':
++                          '55cd2e404c02b181'},
++                         self.megacli._get_block_device_to_wwn())
++
++    @mock.patch.object(MegaCliSetup, '_get_adapters_count')
++    @mock.patch.object(MegaCliSetup, '_megacli_path',
++                       new_callable=mock.PropertyMock)
++    @mock.patch('subprocess.check_output')
++    def test_get_disks_to_wwn(self, exe, path, count):
++        count.return_value = 1
++        path.return_value = 'MegaCli64'
++        with open('ironic_lib/tests/examples/'
++                  'megacli_cmd_outputs/megacli_output.txt') as f:
++            exe.return_value = f.read()
++        mapping = {'0': {'32:9': '55cd2e404c02b114',
++                         '32:10': '55cd2e404c02b181',
++                         '32:12': '55cd2e404c02b232',
++                         '32:18': '55cd80f12302b181'}}
++
++        self.assertDictEqual(self.megacli._get_disks_to_wwn(), mapping)
++
++    @mock.patch.object(MegaCliSetup, '_get_block_device_to_wwn')
++    @mock.patch.object(MegaCliSetup, '_get_disks_to_wwn')
++    def test_map_blk_to_enc(self, disk, block):
++        disk.return_value = {'0': {'32:9': '55cd2e404c02b114',
++                                   '32:10': '55cd2e404c02b181'},
++                             '1': {'32:12': '55cd2e404c02b232',
++                                   '32:18': '55cd80f12302b181'}}
++
++        block.return_value = {'/dev/sda': '55cd2e404c02b114', '/dev/sdb':
++                              '55cd2e404c02b181', '/dev/sdc':
++                              '55cd2e404c02b232', '/dev/sdd':
++                              '55cd80f12302b181'}
++        mapping = {'/dev/sda': {'adapter': '0', 'enc': '32:9'}, '/dev/sdb':
++                   {'adapter': '0', 'enc': '32:10'},
++                   '/dev/sdc': {'adapter': '1', 'enc': '32:12'}, '/dev/sdd':
++                   {'adapter': '1', 'enc': '32:18'}}
++        self.assertEqual(mapping, self.megacli._map_blk_to_enc())
++
++    def test_get_src_names(self):
++        self.assertEqual(['disk0', 'disk1'], self.megacli.get_src_names())
++
++    def test_get_dst_names(self):
++        self.assertEqual(['raid0'], self.megacli.get_dst_names())
++
++    @mock.patch.object(MegaCliSetup, '_get_firmware_state')
++    @mock.patch.object(MegaCliSetup, '_megacli_path',
++                       new_callable=mock.PropertyMock)
++    @mock.patch('subprocess.check_call')
++    def test_make_disks_good_one_disk(self, call, path, fw):
++        path.return_value = 'MegaCli64'
++        fw.return_value = 'JBOD'
++        self.megacli._make_disks_good(['32:12'], 0)
++        call.assert_called_once_with('MegaCli64 -PDMakeGood -PhysDrv [32:12] '
++                                     '-Force -a0'.split())
++
++    @mock.patch.object(MegaCliSetup, '_get_firmware_state')
++    @mock.patch.object(MegaCliSetup, '_megacli_path',
++                       new_callable=mock.PropertyMock)
++    @mock.patch('subprocess.check_call')
++    def test_make_disks_good_multiple_disks(self, call, path, fw):
++        path.return_value = 'MegaCli64'
++        fw.return_value = 'jbod'
++        self.megacli._make_disks_good(['32:12', '32:14'], 0)
++        call.assert_any_call('MegaCli64 -PDMakeGood -PhysDrv [32:12] '
++                             '-Force -a0'.split())
++        call.assert_any_call('MegaCli64 -PDMakeGood -PhysDrv [32:14] '
++                             '-Force -a0'.split())
++
++    @mock.patch.object(MegaCliSetup, '_get_firmware_state')
++    @mock.patch.object(MegaCliSetup, '_megacli_path',
++                       new_callable=mock.PropertyMock)
++    @mock.patch('subprocess.check_call')
++    def test_make_disks_good_multiple_disks_already_good(self, call, path, fw):
++        path.return_value = 'MegaCli64'
++        fw.return_value = 'good'
++        self.megacli._make_disks_good(['32:12', '32:14'], 0)
++        call.assert_not_called()
++
++    @mock.patch.object(MegaCliSetup, '_hctl_to_disk')
++    @mock.patch.object(MegaCliSetup, '_get_adapters_to_pci_bus')
++    @mock.patch.object(MegaCliSetup, '_make_raid')
++    def test_make_disk_jbod_one_disk(self, make, adapter, hctl):
++        adapter.return_value = {'0': '02:00.0'}
++        pds_in_lds = {'0': {'0': ['32:12']}}
++        make.return_value = '0'
++        self.megacli._make_disks_jbod(['32:12'], '512', '0', pds_in_lds)
++        make.assert_called_once_with(0, '512', ['32:12'], '0', pds_in_lds)
++        hctl.assert_called_once_with('02:00.0', '0')
++
++    @mock.patch.object(MegaCliSetup, '_hctl_to_disk')
++    @mock.patch.object(MegaCliSetup, '_get_adapters_to_pci_bus')
++    @mock.patch.object(MegaCliSetup, '_make_raid')
++    def test_make_disk_jbod_two_disks(self, make, adapter, hctl):
++        adapter.return_value = {'0': '02:00.0'}
++        pds_in_lds = {'0': {'0': ['32:12', '32:12']}}
++        make.side_effect = ['0', '12']
++        self.megacli._make_disks_jbod(['32:12', '32:14'], '512', '0',
++                                      pds_in_lds)
++        make.assert_any_call(0, '512', ['32:12'], '0', pds_in_lds)
++        make.assert_any_call(0, '512', ['32:14'], '0', pds_in_lds)
++        hctl.assert_any_call('02:00.0', '0')
++        hctl.assert_any_call('02:00.0', '12')
++
++    @mock.patch.object(MegaCliSetup, '_delete_raid')
++    @mock.patch.object(MegaCliSetup, '_megacli_path',
++                       new_callable=mock.PropertyMock)
++    @mock.patch('subprocess.check_output')
++    def test_make_raid_5(self, exe, path, delete):
++        path.return_value = 'MegaCli64'
++        lines = ['', 'Adapter 0: Created VD 0', '',
++                 'Adapter 0: Configured the Adapter!!', '', 'Exit Code: 0x00']
++        exe.return_value = '\n'.join(lines)
++        pds_in_lds = {'0': {'0': ['32:12'],
++                            '1': ['32:11']}}
++        self.assertEqual('0', self.megacli._make_raid(5, '1024',
++                                                      ['32:12', '32:11'], '0',
++                                                      pds_in_lds))
++        exe.assert_any_call('MegaCli64 -CfgLDAdd -R5 [32:12,32:11] '
++                            '-strpsz1024 -a0'.split())
++        delete.assert_any_call('0', '0')
++        delete.assert_any_call('1', '0')
++
++    @mock.patch.object(MegaCliSetup, '_delete_raid')
++    @mock.patch.object(MegaCliSetup, '_megacli_path',
++                       new_callable=mock.PropertyMock)
++    @mock.patch('subprocess.check_output')
++    def test_make_raid_10(self, exe, path, delete):
++        path.return_value = 'MegaCli64'
++        lines = ['', 'Adapter 0: Created VD 0', '',
++                 'Adapter 0: Configured the Adapter!!', '', 'Exit Code: 0x00']
++        exe.return_value = '\n'.join(lines)
++        pds_in_lds = {'1': {'0': ['32:12'],
++                            '1': ['32:11'],
++                            '3': ['32:9'],
++                            '2': ['32:10']}}
++        self.assertEqual('0', self.megacli._make_raid(10, '1024', ['32:12',
++                                                                   '32:11',
++                                                                   '32:10',
++                                                                   '32:9'],
++                                                      '1', pds_in_lds))
++        exe.assert_any_call('MegaCli64 -CfgSpanAdd R10 Array0 [32:12,32:11] '
++                            'Array1 [32:10,32:9] -strpsz1024 -a1'.split())
++        delete.assert_any_call('0', '1')
++        delete.assert_any_call('1', '1')
++        delete.assert_any_call('2', '1')
++        delete.assert_any_call('3', '1')
++
++    @mock.patch.object(MegaCliSetup, '_delete_raid')
++    @mock.patch.object(MegaCliSetup, '_megacli_path',
++                       new_callable=mock.PropertyMock)
++    @mock.patch('subprocess.check_output')
++    def test_make_raid_10_6disks(self, exe, path, delete):
++        path.return_value = 'MegaCli64'
++        lines = ['', 'Adapter 0: Created VD 0', '',
++                 'Adapter 0: Configured the Adapter!!', '', 'Exit Code: 0x00']
++        exe.return_value = '\n'.join(lines)
++        pds_in_lds = {'0': {'0': ['32:12'],
++                            '1': ['32:11'],
++                            '3': ['32:9'],
++                            '4': ['32:8'],
++                            '5': ['32:7'],
++                            '2': ['32:10']}}
++        self.assertEqual('0', self.megacli._make_raid(10, 256, ['32:12',
++                                                                '32:11',
++                                                                '32:10',
++                                                                '32:9',
++                                                                '32:8',
++                                                                '32:7'],
++                                                      '0', pds_in_lds))
++        exe.assert_any_call('MegaCli64 -CfgSpanAdd R10 Array0 [32:12,32:11] '
++                            'Array1 [32:10,32:9] Array2 [32:8,32:7] '
++                            '-strpsz256 -a0'.split())
++        delete.assert_any_call('0', '0')
++        delete.assert_any_call('1', '0')
++        delete.assert_any_call('2', '0')
++        delete.assert_any_call('3', '0')
++        delete.assert_any_call('4', '0')
++        delete.assert_any_call('5', '0')
++
++    @mock.patch.object(MegaCliSetup, '_delete_raid')
++    def test_make_raid_unknown_raid(self, delete):
++        pds_in_lds = {'0': {'0': ['32:12'],
++                            '1': ['32:11']}}
++        with self.assertRaises(exceptions.ConfError):
++            self.megacli._make_raid(77, '512', ['32:11'], '0', pds_in_lds)
++
++        delete.assert_any_call('1', '0')
++
++    @mock.patch.object(MegaCliSetup, '_delete_raid')
++    @mock.patch.object(MegaCliSetup, '_megacli_path',
++                       new_callable=mock.PropertyMock)
++    @mock.patch('subprocess.check_output')
++    def test_make_raid_5_wrong_output(self, exe, path, delete):
++        path.return_value = 'MegaCli64'
++        lines = ['', 'Adapter 0: Created RAID 0', '',
++                 'Adapter 0: Configured the Adapter!!', '', 'Exit Code: 0x00']
++        exe.return_value = '\n'.join(lines)
++        pds_in_lds = {'0': {'0': ['32:12'],
++                            '1': ['32:11']}}
++        with self.assertRaises(exceptions.EnvError):
++            self.megacli._make_raid(5, '512', ['32:12', '32:11'], '0',
++                                    pds_in_lds)
++
++        exe.assert_any_call('MegaCli64 -CfgLDAdd -R5 [32:12,32:11] '
++                            '-strpsz512 -a0'.split())
++        delete.assert_any_call('0', '0')
++        delete.assert_any_call('1', '0')
++
++    @mock.patch.object(MegaCliSetup, '_megacli_path',
++                       new_callable=mock.PropertyMock)
++    @mock.patch('subprocess.check_output')
++    def test_get_target_of_vd(self, exe, path):
++        path.return_value = 'MegaCli64'
++        with open('ironic_lib/tests/examples/'
++                  'megacli_cmd_outputs/megacli_ld_output.txt') as f:
++            exe.return_value = f.read()
++        self.assertEqual('0', self.megacli._get_target_of_vd('0', '0'))
++        exe.assert_any_call('MegaCli64 -LDInfo -L0 -a0'.split())
++
++    @mock.patch.object(MegaCliSetup, '_megacli_path',
++                       new_callable=mock.PropertyMock)
++    @mock.patch('subprocess.check_output')
++    def test_get_firmware_state_jbod(self, exe, path):
++        path.return_value = 'MegaCli64'
++        with open('ironic_lib/tests/examples/megacli_cmd_outputs/'
++                  'megacli_pdinfo_jbod_output.txt') as f:
++            exe.return_value = f.read()
++        self.assertEqual('jbod',
++                         self.megacli._get_firmware_state('32:12', '0'))
++        exe.assert_any_call('MegaCli64 -PDInfo -PhysDrv [32:12] -a0'.split())
++
++    @mock.patch.object(MegaCliSetup, '_megacli_path',
++                       new_callable=mock.PropertyMock)
++    @mock.patch('subprocess.check_output')
++    def test_get_firmware_state_good(self, exe, path):
++        path.return_value = 'MegaCli64'
++        with open('ironic_lib/tests/examples/megacli_cmd_outputs/'
++                  'megacli_pdinfo_unconfigured_output.txt') as f:
++            exe.return_value = f.read()
++        self.assertEqual('good',
++                         self.megacli._get_firmware_state('32:12', '0'))
++        exe.assert_any_call('MegaCli64 -PDInfo -PhysDrv [32:12] -a0'.split())
++
++    def test_get_adapter(self):
++        mapping = {'/dev/sda': {'adapter': '0', 'enc': '32:9'}, '/dev/sdb':
++                   {'adapter': '0', 'enc': '32:10'},
++                   '/dev/sdc': {'adapter': '1', 'enc': '32:12'}, '/dev/sdd':
++                   {'adapter': '1', 'enc': '32:18'}}
++        partitions = ['disk0', 'disk1']
++        devices = {'disk0': '/dev/sda', 'disk1': '/dev/sdb'}
++        self.assertEqual('0', self.megacli._get_adapter(mapping, partitions,
++                                                        devices))
++
++    def test_get_adapter_fail(self):
++        mapping = {'/dev/sda': {'adapter': '0', 'enc': '32:9'}, '/dev/sdb':
++                   {'adapter': '0', 'enc': '32:10'},
++                   '/dev/sdc': {'adapter': '1', 'enc': '32:12'}, '/dev/sdd':
++                   {'adapter': '1', 'enc': '32:18'}}
++        partitions = ['disk0', 'disk1']
++        devices = {'disk0': '/dev/sda', 'disk1': '/dev/sdc'}
++        with self.assertRaises(exceptions.EnvError):
++            self.megacli._get_adapter(mapping, partitions, devices)
++
++    def test_get_encs_from_partitions(self):
++        mapping = {'/dev/sda': {'adapter': '0', 'enc': '32:9'}, '/dev/sdb':
++                   {'adapter': '0', 'enc': '32:10'},
++                   '/dev/sdc': {'adapter': '1', 'enc': '32:12'}, '/dev/sdd':
++                   {'adapter': '1', 'enc': '32:18'}}
++        partitions = ['disk0', 'disk1']
++        devices = {'disk0': '/dev/sda', 'disk1': '/dev/sdb'}
++        self.assertEqual(['32:9', '32:10'],
++                         self.megacli._get_encs_from_partitions(mapping,
++                                                                partitions,
++                                                                devices))
++
++    @mock.patch('subprocess.check_output')
++    def test_hctl_to_disk(self, exe):
++        lsblk = ('{"blockdevices": [ {"name": "sda",'
++                 '"hctl": "0:2:0:0"}]}')
++
++        with open('ironic_lib/tests/examples/'
++                  'megacli_cmd_outputs/udevadm_output.txt') as f:
++            udev_out = f.read()
++
++        exe.side_effect = [lsblk, udev_out]
++
++        self.assertEqual("/dev/sda",
++                         self.megacli._hctl_to_disk("02:00.0", "0"))
++        exe.assert_any_call('lsblk -o NAME,HCTL -d -n -J'.split())
++
++    @mock.patch('subprocess.check_output')
++    def test_hctl_to_disk_fail(self, exe):
++        lsblk = ('{"blockdevices": [ {"name": "sda",'
++                 '"hctl": "0:0:17:0"}]}')
++        with open('ironic_lib/tests/examples/'
++                  'megacli_cmd_outputs/udevadm_output.txt') as f:
++            udev_out = f.read()
++
++        exe.side_effect = [lsblk, udev_out, lsblk, udev_out, lsblk, udev_out,
++                           lsblk, udev_out, lsblk, udev_out, lsblk, udev_out]
++
++        with self.assertRaises(exceptions.EnvError):
++            self.megacli._hctl_to_disk("02:00.0", "0")
++
++        exe.assert_any_call('lsblk -o NAME,HCTL -d -n -J'.split())
++
++    # ./MegaCli64 -AdpAllinfo -a0
++    @mock.patch.object(MegaCliSetup, '_megacli_path',
++                       new_callable=mock.PropertyMock)
++    @mock.patch.object(MegaCliSetup, '_get_adapters_count')
++    @mock.patch('subprocess.check_output')
++    def test_get_adapter_to_pci_bus(self, exe, ada, mega):
++        mega.return_value = 'MegaCli64'
++        ada.return_value = 1
++        line = " ".join(['02:00.0', 'RAID', 'bus', 'controller', '[0104]:',
++                         'LSI', 'Logic', '/', 'Symbios', 'Logic', 'MegaRAID',
++                         'SAS-3', '3108', '[Invader]', '[1000:005d]', '(rev',
++                         '02)'])
++        with open('ironic_lib/tests/examples/megacli_cmd_outputs/'
++                  'megacli_adinfo_output.txt') as f:
++            exe.side_effect = [f.read(), line]
++        self.assertEqual({'0': '02:00.0'},
++                         self.megacli._get_adapters_to_pci_bus())
++        exe.assert_any_call('MegaCli64 -AdpAllInfo -a0'.split())
++
++    # 02:00.0 RAID bus controller [0104]: LSI Logic / Symbios Logic MegaRAID
++    # SAS-3 3108 [Invader] [1000:005d] (rev 02)
++    def test_get_bus_from_lspci(self):
++        line = " ".join(['02:00.0', 'RAID', 'bus', 'controller', '[0104]:',
++                         'LSI', 'Logic', '/', 'Symbios', 'Logic', 'MegaRAID',
++                         'SAS-3', '3108', '[Invader]', '[1000:005d]', '(rev',
++                         '02)'])
++
++        self.assertEqual('02:00.0', self.megacli._get_bus_from_lspci(line))
++
++    # @mock.patch.object(MegaCliSetup, '_megacli_path',
++    #                    new_callable=mock.PropertyMock)
++    # @mock.patch('subprocess.check_output')
++    # def test_get_adapter_count(self, exe, mega):
++    #     mega.return_value = 'MegaCli64'
++    #     exe.return_value = "\n".join(['', '', 'Controller Count: 1.', '',
++    #                                   'Exit Code: 0x01'])
++    #     self.assertEqual(1, self.megacli._get_adapters_count())
++    #     exe.assert_any_call(['MegaCli64', '-AdpCount'])
++
++    @mock.patch('subprocess.check_output')
++    def test_get_disks_count(self, exe):
++        exe.return_value = '\n'.join(['sda', 'sdb', 'sdc'])
++        self.assertEqual(3, self.megacli._get_disks_count())
++
++    @mock.patch.object(MegaCliSetup, '_megacli_path',
++                       new_callable=mock.PropertyMock)
++    @mock.patch('subprocess.check_output')
++    def test_get_not_jbod_disks(self, exe, path):
++        path.return_value = 'MegaCli64'
++        with open('ironic_lib/tests/examples/'
++                  'megacli_cmd_outputs/megacli_output.txt') as f:
++            exe.return_value = f.read()
++
++        disks = {'0': ['32:9', '32:10', '32:12', '32:18']}
++        self.assertEqual(disks, self.megacli._get_not_jbod_disks())
++
++    @mock.patch('ironic_lib.system_installer.tools.get_controller_for_disks')
++    @mock.patch('ironic_lib.system_installer.tools.get_pds_for_raid')
++    @mock.patch.object(MegaCliSetup, '_get_pds_in_lds')
++    @mock.patch.object(MegaCliSetup, '_get_lds_info')
++    @mock.patch.object(MegaCliSetup, '_megacli_path',
++                       new_callable=mock.PropertyMock)
++    @mock.patch.object(PartitionSetup, 'get_not_partitioned_candidates')
++    @mock.patch.object(MegaCliSetup, '_get_adapters_to_pci_bus')
++    @mock.patch.object(MegaCliSetup, '_make_raid')
++    @mock.patch.object(MegaCliSetup, '_hctl_to_disk')
++    def test_setup_disk(self, hctl, raid, adapter, part, path, lds, pds_in_lds,
++                        pds_for_raid, ctrl_for_disks):
++        path.return_value = 'MegaCli64'
++        disks = {"disk0": "/dev/sda", "disk1": "/dev/sdb"}
++        part.return_value = disks
++        adapter.return_value = {'0': '02:00.0'}
++        lds_info_1 = {'0': {'0': {'raidtype': 0, 'disks_num': 1, 'disk':
++                                  '/dev/sda'},
++                            '1': {'raidtype': 0, 'disks_num': 1, 'disk':
++                                  '/dev/sdb'}}}
++        lds_info_2 = {'0': {'0': {'raidtype': 1, 'disks_num': 2, 'disk':
++                                  '/dev/sda'}}}
++        lds.side_effect = [lds_info_1, lds_info_2]
++        ctrl_for_disks.return_value = '0'
++        pds_in_lds_dict = {'0': {'0': ['252:0'],
++                                 '1': ['252:1']}}
++        pds_in_lds.return_value = pds_in_lds_dict
++        pds_for_raid.return_value = ['252:0', '252:1']
++        raid.return_value = '0'
++        hctl.return_value = '/dev/sda'
++        expected = {'raid0': '/dev/sda',
++                    'disk0': '/dev/sda',
++                    'disk1': '/dev/sdb'}
++        self.assertEqual(expected, self.megacli.setup_disks({}))
++        raid.assert_called_once_with(1, 512, ['252:0', '252:1'], '0',
++                                     pds_in_lds_dict)
++
++    @mock.patch('ironic_lib.system_installer.tools.get_controller_for_disks')
++    @mock.patch('ironic_lib.system_installer.tools.get_pds_for_raid')
++    @mock.patch.object(MegaCliSetup, '_get_pds_in_lds')
++    @mock.patch.object(MegaCliSetup, '_get_lds_info')
++    @mock.patch.object(MegaCliSetup, '_megacli_path',
++                       new_callable=mock.PropertyMock)
++    @mock.patch.object(PartitionSetup, 'get_not_partitioned_candidates')
++    @mock.patch.object(MegaCliSetup, '_get_adapters_to_pci_bus')
++    @mock.patch.object(MegaCliSetup, '_make_raid')
++    @mock.patch.object(MegaCliSetup, '_hctl_to_disk')
++    def test_setup_disk_raid_in_dev(self, hctl, raid, adapter, part, path,
++                                    lds, pds_in_lds, pds_for_raid,
++                                    ctrl_for_disks):
++        path.return_value = 'MegaCli64'
++        with open('ironic_lib/tests/examples/megacli_2_raids.yml') as f:
++            conf = yaml.load(f)
++        megacli = MegaCliSetup(conf['disk_config'])
++        disks = {"disk0": "/dev/sda", "disk1": "/dev/sde",
++                 'disk2': '/dev/sdc', 'disk3': '/dev/sdd'}
++        part.return_value = disks
++        adapter.return_value = {'0': '02:00.0'}
++        lds_info_1 = {'0': {'0': {'raidtype': 0, 'disks_num': 1, 'disk':
++                                  '/dev/sda'},
++                            '1': {'raidtype': 0, 'disks_num': 1, 'disk':
++                                  '/dev/sdd'},
++                            '3': {'raidtype': 0, 'disks_num': 1, 'disk':
++                                  '/dev/sde'},
++                            '4': {'raidtype': 1, 'disks_num': 2, 'disk':
++                                  '/dev/sdb'},
++                            '2': {'raidtype': 0, 'disks_num': 1, 'disk':
++                                  '/dev/sdc'}}}
++        lds_info_2 = {'0': {'0': {'raidtype': 1, 'disks_num': 2, 'disk':
++                                  '/dev/sda'},
++                            '1': {'raidtype': 0, 'disks_num': 1, 'disk':
++                                  '/dev/sdd'},
++                            '4': {'raidtype': 1, 'disks_num': 2, 'disk':
++                                  '/dev/sdb'},
++                            '2': {'raidtype': 0, 'disks_num': 1, 'disk':
++                                  '/dev/sdc'}}}
++        lds.side_effect = [lds_info_1, lds_info_2]
++        ctrl_for_disks.return_value = '0'
++        pds_in_lds_dict = {'0': {'0': ['252:0'],
++                                 '1': ['252:1'],
++                                 '3': ['252:3'],
++                                 '2': ['252:4'],
++                                 '4': ['252:2', '252:8']}}
++        pds_in_lds.return_value = pds_in_lds_dict
++        pds_for_raid.return_value = ['252:0', '252:3']
++        raid.return_value = '0'
++        hctl.return_value = '/dev/sda'
++        expected = {'raid0': '/dev/sda', 'raid1': '/dev/sdb',
++                    'disk0': '/dev/sda', 'disk1': '/dev/sde',
++                    'disk2': '/dev/sdc', 'disk3': '/dev/sdd'}
++        self.assertEqual(expected, megacli.setup_disks({'raid1': '/dev/sdb'}))
++        raid.assert_called_once_with(1, 512, ['252:0', '252:3'], '0',
++                                     pds_in_lds_dict)
++
++    @mock.patch.object(MegaCliSetup, '_hctl_to_disk')
++    @mock.patch.object(MegaCliSetup, '_get_adapters_to_pci_bus')
++    @mock.patch.object(MegaCliSetup, '_megacli_path',
++                       new_callable=mock.PropertyMock)
++    @mock.patch('subprocess.check_call')
++    @mock.patch('subprocess.check_output')
++    def test_delete_raid(self, exe, call, path, adapter, hctl):
++        hctl.return_value = '/dev/sda'
++        adapter.return_value = {'0': '02:00.0'}
++        path.return_value = 'MegaCli64'
++        lsblk_json = '{"blockdevices": [{"name": "sda", "hctl": "5:0:0:0"}]}'
++        exe.return_value = lsblk_json
++        self.megacli._delete_raid('0', '0')
++        call.assert_called_once_with('MegaCli64 -CfgLdDel -L0 -a0'.split())
++
++    @mock.patch('subprocess.check_output')
++    @mock.patch.object(MegaCliSetup, '_get_adapters_to_pci_bus')
++    def test_get_vd_info(self, adapter, exe):
++        adapter.return_value = {'0': '02:00.0'}
++        with open('ironic_lib/tests/examples/'
++                  'megacli_cmd_outputs/udevadm_output.txt') as f:
++            exe.return_value = f.read()
++
++        result = {'adapter': '0', 'target': '0'}
++        self.assertDictEqual(self.megacli._get_vd_info('/dev/sdb'), result)
++
++    @mock.patch('subprocess.check_output')
++    @mock.patch.object(MegaCliSetup, '_get_adapters_to_pci_bus')
++    def test_get_vd_info_fails(self, adapter, exe):
++        adapter.return_value = {'0': '02:01.0'}
++        with open('ironic_lib/tests/examples/'
++                  'megacli_cmd_outputs/udevadm_output.txt') as f:
++            exe.return_value = f.read()
++
++        self.assertEqual(self.megacli._get_vd_info('/dev/sdb'), None)
++
++    @mock.patch.object(MegaCliSetup, '_delete_raid')
++    @mock.patch.object(MegaCliSetup, '_make_disks_jbod')
++    @mock.patch.object(MegaCliSetup, '_make_disks_good')
++    @mock.patch.object(MegaCliSetup, '_get_pds_in_lds')
++    @mock.patch.object(MegaCliSetup, '_get_lds_info')
++    @mock.patch.object(MegaCliSetup, '_get_not_jbod_disks')
++    def test_clean_disks_empty(self, not_jbod, lds_info, pds_in_lds, good,
++                               jbod, delete):
++        pds = []
++        not_jbod.return_value = {'0': pds}
++        lds_info_1 = {'0': {}}
++        lds_info.return_value = lds_info_1
++        pds_in_lds.return_value = {'0': {}}
++        excluded_devices = {}
++        self.megacli.clean_disks(excluded_devices)
++        good.assert_called_once_with([], '0')
++        jbod.assert_called_once_with([], self.megacli.default_stripe_size, '0',
++                                     {'0': {}})
++
++    @mock.patch.object(MegaCliSetup, '_delete_raid')
++    @mock.patch.object(MegaCliSetup, '_make_disks_jbod')
++    @mock.patch.object(MegaCliSetup, '_make_disks_good')
++    @mock.patch.object(MegaCliSetup, '_get_firmware_state')
++    @mock.patch.object(MegaCliSetup, '_get_pds_in_lds')
++    @mock.patch.object(MegaCliSetup, '_get_lds_info')
++    @mock.patch.object(MegaCliSetup, '_get_not_jbod_disks')
++    def test_clean_disks_preserve(self, not_jbod, lds_info, pds_in_lds, fw,
++                                  good, jbod, delete):
++        pds = ['32:9', '32:10', '32:12', '32:18']
++        not_jbod.return_value = {'0': pds}
++        lds_info_1 = {'0': {'0': {'raidtype': 1, 'disks_num': 2, 'disk':
++                                  '/dev/sda'},
++                            '2': {'raidtype': 1, 'disks_num': 2, 'disk':
++                                  '/dev/sdb'},
++                            '1': {'raidtype': 0, 'disks_num': 1, 'disk':
++                                  '/dev/sdb'}}}
++        lds_info.return_value = lds_info_1
++        pds_in_lds_dict_1 = {'0': {'0': ['32:12', '32:20'],
++                                   '2': ['32:14', '32:16'],
++                                   '1': ['32:11']}}
++        pds_in_lds_dict_2 = {'0': {'0': ['32:12', '32:20'],
++                                   '2': ['32:14', '32:16'],
++                                   '1': ['32:11']}}
++        pds_in_lds_dict_3 = {'0': {'0': ['32:12', '32:20'],
++                                   '1': ['32:11']}}
++        pds_in_lds.side_effect = [pds_in_lds_dict_1, pds_in_lds_dict_2,
++                                  pds_in_lds_dict_3]
++        fw.side_effect = ['good', 'jbod', 'online', 'jbod']
++        excluded_devices = {'raid0': '/dev/sda'}
++        self.megacli.clean_disks(excluded_devices)
++        stripe_size = self.megacli.default_stripe_size
++        good.assert_called_once_with(['32:10', '32:18'], '0')
++        jbod.assert_any_call(pds, stripe_size, '0', pds_in_lds_dict_1)
++        delete.assert_called_once_with('2', '0')
++        jbod.assert_any_call(['32:14', '32:16'], stripe_size, '0',
++                             pds_in_lds_dict_3)
++
++    @mock.patch.object(MegaCliSetup, '_megacli_path',
++                       new_callable=mock.PropertyMock)
++    @mock.patch('subprocess.check_output')
++    def test_get_all_vds(self, exe, path):
++        path.return_value = 'MegaCli64'
++        with open('ironic_lib/tests/examples/megacli_cmd_outputs/'
++                  'megacli_ldinfo_2lds_output.txt') as f:
++            exe.return_value = f.read()
++
++        expected = {'0': ['0', '1']}
++        self.assertDictEqual(self.megacli._get_all_vds(), expected)
++
++    @mock.patch('subprocess.check_output')
++    def test_is_megacli_controller(self, exe):
++        with open('ironic_lib/tests/examples/megacli_cmd_outputs/'
++                  'lspci_output.txt') as f:
++            exe.return_value = f.read()
++        self.assertTrue(self.megacli.is_megacli_controller())
++
++    @mock.patch('subprocess.check_output')
++    def test_is_megacli_controller_fails(self, exe):
++        exe.return_value = ' '.join([' 00:1f.2 SATA controller:',
++                                     'Intel Corporation',
++                                     'C610/X99 series chipset 6-Port SATA',
++                                     'Controller [AHCI mode] (rev 05)', '\n'])
++        self.assertFalse(self.megacli.is_megacli_controller())
++
++    @mock.patch.object(MegaCliSetup, '_hctl_to_disk')
++    @mock.patch.object(MegaCliSetup, '_get_adapters_to_pci_bus')
++    @mock.patch.object(MegaCliSetup, '_megacli_path',
++                       new_callable=mock.PropertyMock)
++    @mock.patch('subprocess.check_output')
++    def test_get_lds_info(self, exe, megacli, adapter, hctl):
++        hctl.side_effect = ['/dev/sda', '/dev/sdb', '/dev/sdc']
++        adapter.return_value = {'0': '02:01.0'}
++        megacli.return_value = 'MegaCli64'
++        with open('ironic_lib/tests/examples/megacli_cmd_outputs/'
++                  'megacli_ldpdinfo.txt') as f:
++            exe.return_value = f.read()
++
++        expected_output = {'0': {'0': {'raidtype': 0, 'disks_num': 1, 'disk':
++                                       '/dev/sda'},
++                                 '1': {'raidtype': 0, 'disks_num': 1, 'disk':
++                                       '/dev/sdb'},
++                                 '2': {'raidtype': 0, 'disks_num': 2, 'disk':
++                                       '/dev/sdc'}}}
++
++        self.assertDictEqual(expected_output, self.megacli._get_lds_info())
++
++    @mock.patch.object(MegaCliSetup, '_hctl_to_disk')
++    @mock.patch.object(MegaCliSetup, '_get_adapters_to_pci_bus')
++    @mock.patch.object(MegaCliSetup, '_megacli_path',
++                       new_callable=mock.PropertyMock)
++    @mock.patch('subprocess.check_output')
++    def test_get_lds_info_raid10(self, exe, megacli, adapter, hctl):
++        hctl.return_value = '/dev/sda'
++        adapter.return_value = {'0': '02:01.0'}
++        megacli.return_value = 'MegaCli64'
++        with open('ironic_lib/tests/examples/megacli_cmd_outputs/'
++                  'megacli_ldpdinfo_raid10.txt') as f:
++            exe.return_value = f.read()
++
++        expected_output = {'0': {'0': {'raidtype': 10, 'disks_num': 4, 'disk':
++                                       '/dev/sda'}}}
++
++        self.assertDictEqual(expected_output, self.megacli._get_lds_info())
++
++    @mock.patch.object(MegaCliSetup, '_megacli_path',
++                       new_callable=mock.PropertyMock)
++    @mock.patch('subprocess.check_output')
++    def test_get_pds_in_lds(self, exe, megacli):
++        megacli.return_value = 'MegaCli64'
++        with open('ironic_lib/tests/examples/megacli_cmd_outputs/'
++                  'megacli_ldpdinfo.txt') as f:
++            exe.return_value = f.read()
++
++        expected_output = {'0': {'0': ['252:0'],
++                                 '1': ['252:1'],
++                                 '2': ['252:2', '252:3']}}
++
++        self.assertDictEqual(expected_output, self.megacli._get_pds_in_lds())
++
++    @mock.patch('ironic_lib.system_installer.tools.validate_raid')
++    def test_validate_conf(self, raid):
++        self.megacli.validate_conf()
++        raid.assert_called_once_with(1, ['disk0', 'disk1'])
++
++    @mock.patch('ironic_lib.system_installer.tools.validate_raid')
++    def test_validate_conf_fail(self, raid):
++        self.megacli.conf['raid0']['stripe_size'] = 100
++        with self.assertRaises(exceptions.ConfError):
++            self.megacli.validate_conf()
++        raid.assert_called_once_with(1, ['disk0', 'disk1'])
++
++    @mock.patch('ironic_lib.system_installer.tools.validate_raid')
++    def test_validate_conf_512kB(self, raid):
++        self.megacli.conf['raid0']['stripe_size'] = 512
++        self.megacli.validate_conf()
++        raid.assert_called_once_with(1, ['disk0', 'disk1'])
+diff --git a/ironic_lib/tests/test_tools.py b/ironic_lib/tests/test_tools.py
+index 6e0cd12..9f858ec 100644
+--- a/ironic_lib/tests/test_tools.py
++++ b/ironic_lib/tests/test_tools.py
+@@ -15,7 +15,8 @@
+ 
+ import unittest
+ 
+-import ironic_lib.system_installer.tools as tools
++from ironic_lib.system_installer import exceptions
++from ironic_lib.system_installer import tools
+ import mock
+ 
+ 
+@@ -33,3 +34,147 @@ class ToolsTest(unittest.TestCase):
+         memsize = tools.get_memsize_kB()
+         print(memsize)
+         self.assertEqual("32825036", memsize)
++
++    def testvalidate_raid_0(self):
++        raidtype = 0
++        partitions = ['disk0', 'disk1', 'disk2', 'disk4']
++        tools.validate_raid(raidtype, partitions)
++
++    def testvalidate_raid_0_odd_number(self):
++        raidtype = 0
++        partitions = ['disk0', 'disk1', 'disk2']
++        self.assertTrue(tools.validate_raid(raidtype, partitions))
++
++    def testvalidate_raid_1(self):
++        raidtype = 1
++        partitions = ['disk0', 'disk1', 'disk2', 'disk4']
++        self.assertTrue(tools.validate_raid(raidtype, partitions))
++
++    def testvalidate_raid_1_odd_number(self):
++        raidtype = 1
++        partitions = ['disk0', 'disk1', 'disk2']
++        self.assertFalse(tools.validate_raid(raidtype, partitions))
++
++    def testvalidate_raid_1_too_few(self):
++        raidtype = 1
++        partitions = ['disk0']
++        self.assertFalse(tools.validate_raid(raidtype, partitions))
++
++    def testvalidate_raid_5(self):
++        raidtype = 5
++        partitions = ['disk0', 'disk1', 'disk2', 'disk4']
++        self.assertTrue(tools.validate_raid(raidtype, partitions))
++
++    def testvalidate_raid_5_odd_number(self):
++        raidtype = 5
++        partitions = ['disk0', 'disk1', 'disk2']
++        self.assertTrue(tools.validate_raid(raidtype, partitions))
++
++    def testvalidate_raid_5_too_few(self):
++        raidtype = 5
++        partitions = ['disk0', 'disk1']
++        self.assertFalse(tools.validate_raid(raidtype, partitions))
++
++    def testvalidate_raid_6(self):
++        raidtype = 6
++        partitions = ['disk0', 'disk1', 'disk2', 'disk4']
++        self.assertTrue(tools.validate_raid(raidtype, partitions))
++
++    def testvalidate_raid_6_odd_number(self):
++        raidtype = 6
++        partitions = ['disk0', 'disk1', 'disk2', 'disk3', 'disk4']
++        self.assertTrue(tools.validate_raid(raidtype, partitions))
++
++    def testvalidate_raid_6_too_few(self):
++        raidtype = 6
++        partitions = ['disk0', 'disk1', 'disk2']
++        self.assertFalse(tools.validate_raid(raidtype, partitions))
++
++    def testvalidate_raid_10(self):
++        raidtype = 10
++        partitions = ['disk0', 'disk1', 'disk2', 'disk3']
++        self.assertTrue(tools.validate_raid(raidtype, partitions))
++
++    def testvalidate_raid10_odd_number(self):
++        raidtype = 10
++        partitions = ['disk0', 'disk1', 'disk2', 'disk3', 'disk4']
++        self.assertFalse(tools.validate_raid(raidtype, partitions))
++
++    def testvalidate_raid10_too_few(self):
++        raidtype = 10
++        partitions = ['disk0', 'disk1', 'disk2']
++        self.assertFalse(tools.validate_raid(raidtype, partitions))
++
++    def test_get_pds_for_raid(self):
++        partitions = ['disk0', 'disk1']
++        devices = {'disk0': '/dev/sda', 'disk1': '/dev/sdd'}
++        lds = {'4': {'1': {'label': None, 'disk': '/dev/sda', 'raidtype': 0,
++                           'disks_num': 1},
++                     '4': {'label': None, 'disk': '/dev/sdd', 'raidtype': 0,
++                           'disks_num': 1}}}
++        controller = '4'
++        pds_in_lds = {'4': {'1': ['2I:1:1'], '4': ['2I:1:4']}}
++
++        self.assertListEqual(['2I:1:1', '2I:1:4'],
++                             tools.get_pds_for_raid(partitions, devices,
++                                                    controller, lds,
++                                                    pds_in_lds))
++
++    def test_get_pds_for_raid_not_raid0(self):
++        partitions = ['disk0', 'disk1']
++        devices = {'disk0': '/dev/sda', 'disk1': '/dev/sdd'}
++        lds = {'4': {'1': {'label': None, 'disk': '/dev/sda', 'raidtype': 0,
++                           'disks_num': 1},
++                     '4': {'label': None, 'disk': '/dev/sdd', 'raidtype': 1,
++                           'disks_num': 1}}}
++        controller = '4'
++        pds_in_lds = {'4': {'1': ['2I:1:1'], '4': ['2I:1:4']}}
++
++        with self.assertRaises(exceptions.EnvError):
++            self.assertListEqual(['2I:1:1', '2I:1:4'],
++                                 tools.get_pds_for_raid(partitions, devices,
++                                                        controller,
++                                                        lds, pds_in_lds))
++
++    def test_get_pds_for_raid_not_one_disk(self):
++        partitions = ['disk0', 'disk1']
++        devices = {'disk0': '/dev/sda', 'disk1': '/dev/sdd'}
++        lds = {'4': {'1': {'label': None, 'disk': '/dev/sda', 'raidtype': 0,
++                           'disks_num': 1},
++                     '4': {'label': None, 'disk': '/dev/sdd', 'raidtype': 0,
++                           'disks_num': 2}}}
++        controller = '4'
++        pds_in_lds = {'4': {'1': ['2I:1:1'], '4': ['2I:1:4']}}
++
++        with self.assertRaises(exceptions.EnvError):
++            self.assertListEqual(['2I:1:1', '2I:1:4'],
++                                 tools.get_pds_for_raid(partitions, devices,
++                                                        controller,
++                                                        lds, pds_in_lds))
++
++    def test_get_controllers_for_disks_two_controller(self):
++        lds = {'4': {'1': {'label': 'raid5', 'disk': '/dev/sda', 'raidtype': 5,
++                           'disks_num': 3},
++                     '4': {'label': None, 'disk': '/dev/sdd', 'raidtype': 0,
++                           'disks_num': 1}},
++               '5': {}}
++
++        partitions = ['disk0', 'disk1']
++        devices = {'disk0': '/dev/sda', 'disk1': '/dev/sdd'}
++
++        self.assertEqual('4', tools.get_controller_for_disks(partitions,
++                                                             devices, lds))
++
++    def test_get_controllers_for_disks_two_controller_fail(self):
++        lds = {'4': {'1': {'label': 'raid5', 'disk': '/dev/sda', 'raidtype': 5,
++                           'disks_num': 3}},
++               '5': {'4': {'label': None, 'disk': '/dev/sdd', 'raidtype': 0,
++                           'disks_num': 1}}}
++
++        partitions = ['disk0', 'disk1']
++        devices = {'disk0': '/dev/sda', 'disk1': '/dev/sdd'}
++
++        with self.assertRaises(exceptions.EnvError):
++            self.assertEqual('4', tools.get_controller_for_disks(partitions,
++                                                                 devices,
++                                                                 lds))
+diff --git a/requirements.txt b/requirements.txt
+index 7f0e350..06eaaef 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -16,3 +16,4 @@ oslo.utils>=3.18.0 # Apache-2.0
+ requests!=2.12.2,>=2.10.0 # Apache-2.0
+ six>=1.9.0 # MIT
+ oslo.log>=3.11.0 # Apache-2.0
++retrying
+-- 
+2.16.3
+
