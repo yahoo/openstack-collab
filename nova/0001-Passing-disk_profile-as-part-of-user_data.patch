@@ -1,0 +1,516 @@
+From 6f76f6083ce597dd53fd1dbd31197280dd72dba5 Mon Sep 17 00:00:00 2001
+From: PiotrProkop <piotr.prokop@intel.com>
+Date: Wed, 20 Dec 2017 15:48:39 +0100
+Subject: [PATCH] Passing disk_profile as part of user_data
+
+---
+ nova/tests/unit/virt/ironic/fake_disk_configs.py | 140 +++++++++++++
+ nova/tests/unit/virt/ironic/test_patcher.py      |  29 +++
+ nova/virt/ironic/patcher.py                      |  32 ++-
+ nova/virt/ironic/validation.py                   | 241 +++++++++++++++++++++++
+ 4 files changed, 441 insertions(+), 1 deletion(-)
+ create mode 100644 nova/tests/unit/virt/ironic/fake_disk_configs.py
+ create mode 100644 nova/virt/ironic/validation.py
+
+diff --git a/nova/tests/unit/virt/ironic/fake_disk_configs.py b/nova/tests/unit/virt/ironic/fake_disk_configs.py
+new file mode 100644
+index 0000000000..54bae4d5e0
+--- /dev/null
++++ b/nova/tests/unit/virt/ironic/fake_disk_configs.py
+@@ -0,0 +1,140 @@
++# Copyright 2017 Intel
++# All Rights Reserved.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++
++CORRECT_DISK_CONFIG = """
++disk_config:
++  blockdev:
++    sda:
++      candidates: any
++      partitions:
++        d0p1:
++          size: 512M
++        d0p2:
++          minsize: 2G
++  lvm:
++    sys:
++      LVs:
++        home:
++          minsize: 1G
++        root:
++          size: 10G
++        swap:
++          size: memsize
++        var:
++          size: 4G
++        tmp:
++          size: 4G
++      PVs:
++        - d0p2
++  filesystems:
++    d0p1:
++      label: /boot
++      mountpoint: /boot
++    home:
++      mountpoint: /home
++    root:
++      mountpoint: /
++    swap:
++      fstype: swap
++    var:
++      mountpoint: /var
++    tmp:
++      mountpoint: /tmp
++"""
++
++INCORRECT_DISK_CONFIG = """
++disk_config:
++  blockdev:
++    sda:
++      candidates: blue and red
++      foo:
++        bar: A
++      partitions:
++        d0p1:
++          size: 512M
++        d0p2:
++          minsize: 2G
++  lvm:
++    sys:
++      LVs:
++        home:
++          minsize: 1G
++        root:
++          size: 10G
++        swap:
++          size: memcached
++        var:
++          size: 4G
++        tmp:
++          size: 4G
++      PVs:
++        - d0p2
++  filesystems:
++    d0p1:
++      label: /boot
++      mountpoint: /boot
++    home:
++      mountpoint: /home
++    root:
++      mountpoint: /
++    swap:
++      fstype: swap
++    var:
++      mountpoint: /var
++    tmp:
++      mountpoint: /tmp
++"""
++
++BAD_YAML_DISK_CONFIG = """
++disk_config:
++  blockdev:
++     sda:
++      candidates: blue and red
++          partitions:
++        d0p1:
++          size: 512M
++        d0p2:
++          minsize: 2G
++  lvm:
++    sys:
++      LVs:
++        home:
++          minsize: 1G
++        root:
++          size: 10G
++        swap:
++          size: memsize
++        var:
++          size: 4G
++        tmp:
++          size: 4G
++      PVs:
++        - d0p2
++  filesystems:
++    d0p1:
++      label: /boot
++      mountpoint: /boot
++    home:
++      mountpoint: /home
++    root:
++      mountpoint: /
++    swap:
++      fstype: swap
++    var:
++      mountpoint: /var
++    tmp:
++      mountpoint: /tmp
++"""
+diff --git a/nova/tests/unit/virt/ironic/test_patcher.py b/nova/tests/unit/virt/ironic/test_patcher.py
+index 4def694881..4fa4251f63 100644
+--- a/nova/tests/unit/virt/ironic/test_patcher.py
++++ b/nova/tests/unit/virt/ironic/test_patcher.py
+@@ -13,14 +13,19 @@
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+ 
++import base64
+ import operator
+ 
+ from oslo_config import cfg
++from oslo_serialization import jsonutils
++import yaml
+ 
+ from nova import context as nova_context
++from nova import exception
+ from nova import objects
+ from nova import test
+ from nova.tests.unit import fake_instance
++from nova.tests.unit.virt.ironic import fake_disk_configs as fakes
+ from nova.tests.unit.virt.ironic import utils as ironic_utils
+ from nova.virt.ironic import patcher
+ 
+@@ -143,3 +148,27 @@ class IronicDriverFieldsTestCase(test.NoDBTestCase):
+                          'value': str(preserve), 'op': 'add', }]
+             expected += self._expected_deploy_patch
+             self.assertPatchEqual(expected, patch)
++
++    def test_generic_get_deploy_patch_disk_profile(self):
++        node = ironic_utils.get_test_node(driver='fake')
++        self.instance.user_data = base64.b64encode(fakes.CORRECT_DISK_CONFIG)
++        patch = patcher.create(node).get_deploy_patch(
++                self.instance, self.image_meta, self.flavor)
++        for path in patch:
++            if path["path"] == '/instance_info/ybiip':
++                self.assertEqual(jsonutils.loads(path["value"]),
++                                 yaml.load(fakes.CORRECT_DISK_CONFIG))
++
++    def test_generic_get_deploy_patch_disk_profile_bad_schema(self):
++        node = ironic_utils.get_test_node(driver='fake')
++        self.instance.user_data = base64.b64encode(fakes.INCORRECT_DISK_CONFIG)
++        self.assertRaises(exception.InstanceDeployFailure,
++                          patcher.create(node).get_deploy_patch, self.instance,
++                          self.image_meta, self.flavor)
++
++    def test_generic_get_deploy_patch_disk_profile_bad_yaml(self):
++        node = ironic_utils.get_test_node(driver='fake')
++        self.instance.user_data = base64.b64encode(fakes.BAD_YAML_DISK_CONFIG)
++        self.assertRaises(yaml.YAMLError,
++                          patcher.create(node).get_deploy_patch, self.instance,
++                          self.image_meta, self.flavor)
+diff --git a/nova/virt/ironic/patcher.py b/nova/virt/ironic/patcher.py
+index 651c7012c3..8aba100456 100644
+--- a/nova/virt/ironic/patcher.py
++++ b/nova/virt/ironic/patcher.py
+@@ -17,13 +17,19 @@
+ """
+ Helper classes for Ironic HTTP PATCH creation.
+ """
++import base64
+ 
++import jsonschema
++import logging
+ from oslo_serialization import jsonutils
+-
++import yaml
+ 
+ import nova.conf
++from nova import exception
++from nova.virt.ironic.validation import DISK_CONFIG_SCHEMA
+ 
+ CONF = nova.conf.CONF
++LOG = logging.getLogger(__name__)
+ 
+ 
+ def create(node):
+@@ -105,4 +111,28 @@ class GenericDriverFields(object):
+         if capabilities:
+             patch.append({'path': '/instance_info/capabilities',
+                           'op': 'add', 'value': jsonutils.dumps(capabilities)})
++
++        # add disk_profile to instance_info
++        if instance.user_data:
++            user_data = base64.b64decode(instance.user_data)
++            try:
++                user_data = yaml.load(user_data)
++                if 'disk_config' in user_data:
++                    # validate disk_profile section from user_data against
++                    # json schema
++                    disk_config = {"disk_config": user_data['disk_config']}
++                    jsonschema.validate(disk_config, DISK_CONFIG_SCHEMA)
++                    patch.append({'path': '/instance_info/ybiip',
++                                  'op': 'add',
++                                  'value': jsonutils.dumps(disk_config)})
++
++            except yaml.YAMLError as e:
++                msg = "user_data is not a YAML file: %s" % e.message
++                LOG.error(msg)
++                raise
++            except jsonschema.ValidationError as e:
++                msg = "Disk_profile schema is invalid: %s" % e.message
++                LOG.error(msg)
++                raise exception.InstanceDeployFailure(msg)
++
+         return patch
+diff --git a/nova/virt/ironic/validation.py b/nova/virt/ironic/validation.py
+new file mode 100644
+index 0000000000..1066068816
+--- /dev/null
++++ b/nova/virt/ironic/validation.py
+@@ -0,0 +1,241 @@
++# Copyright 2017 Intel
++# All Rights Reserved.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++DISK_CONFIG_SCHEMA = {
++  "$schema": "http://json-schema.org/schema#",
++  "definitions": {
++    "partition": {
++      "type": "object",
++      "properties": {
++        "size": {
++          "type": "string",
++          "description": "Absolute size of partition"
++        },
++        "minsize": {
++          "type": "string",
++          "description": "Minimum size of partition,"
++                    "if any space left expand this partition"
++        },
++        "type": {
++          "type": "string",
++          "description": "Type of partition"
++        }
++      },
++      "oneOf": [
++        {"required": ["minsize"]},
++        {"required": ["size"]}
++      ],
++      "additionalProperties": False
++    },
++    "blockdevice": {
++      "type": "object",
++      "properties": {
++        "candidates": {
++          "oneOf": [
++            {
++              "type": "string",
++              "description": "Use any device.",
++              "enum": ["any"],
++              "default": "any"
++            },
++            {
++              "type": "object",
++              "description": "Dict of device hints to choose appropriate disk",
++              "properties": {
++                "serial": {
++                  "type": "string",
++                  "description": "Serial number of the disk"
++                },
++                "model": {
++                  "type": "string",
++                  "description": "Model of the disk"
++                },
++                "disk_type": {
++                  "type": "string",
++                  "enum": ["SSD", "HDD", "NVMe"],
++                  "description": "Type of disk to use"
++                },
++                "max_disk_size_gb": {
++                  "type": "string",
++                  "description": "Maximum size of the disk to use"
++                }
++              },
++              "additionalProperties": False
++            }
++          ]
++        },
++        "partitions": {
++          "type": "object",
++          "description": "Dictionary of partitions to create",
++          "additionalProperties": {"$ref": "#/definitions/partition"}
++        }
++      },
++      "additionalProperties": False
++    },
++    "logical_volume": {
++      "type": "object",
++      "properties": {
++        "size": {
++          "type": "string",
++          "description": "Absolute size of LV"
++        },
++        "minsize": {
++          "type": "string",
++          "description": "Minimum size of LV, if any space left expand this LV"
++        }
++      },
++      "oneOf": [
++        {"required": ["minsize"]},
++        {"required": ["size"]}
++      ],
++      "additionalProperties": False
++    },
++    "volume_group": {
++      "type": "object",
++      "properties": {
++        "LVs": {
++          "type": "object",
++          "description": "Dictionary of partitions to create",
++          "additionalProperties": {"$ref": "#/definitions/logical_volume"}
++        },
++        "PVs": {
++          "type": "array",
++          "items": {
++            "type": "string"
++          }
++        }
++      },
++      "additionalProperties": False
++    },
++    "filesystem": {
++      "type": "object",
++      "properties": {
++        "label": {
++          "type": "string",
++          "description": "Label of filesystem"
++        },
++        "mountpoint": {
++          "type": "string",
++          "description": "Where to mount this filesystem."
++        },
++        "fstype": {
++          "type": "string",
++          "description": "Filesystem to create on given partition",
++          "enum": ["xfs", "ext4", "ext3", "swap", "btrfs", "xfat"],
++          "default": "xfs"
++        },
++        "mountopts": {
++          "type": "string",
++          "description": "Options to include in /etc/fstab"
++        },
++        "mkfsopts": {
++          "type": "string",
++          "description": "Options to use when creating filesystem"
++        },
++        "preserve": {
++          "type": "number",
++          "enum": [0, 1],
++          "description": "If set to 1 prevent from wiping data on a given disk"
++        }
++      },
++      "additionalProperties": False
++    },
++    "hwraid": {
++      "type": "object",
++      "properties": {
++        "raidtype": {
++          "type": "number",
++          "enum": [0, 1, 10, 5, 6],
++          "description": "Type of software raid to use"
++        },
++        "stripe_size": {
++          "type": "number",
++          "enum": [64, 128, 256, 512, 1024],
++          "default": 512,
++          "description": "Stripe size in KB"
++        },
++        "partitions": {
++          "description": "List of partitions to make software raid from",
++          "type": "array",
++          "items": {
++            "type": "string"
++          }
++        }
++      },
++      "additionalProperties": False
++    },
++    "software_raid": {
++      "type": "object",
++      "properties": {
++        "raidtype": {
++          "type": "number",
++          "enum": [0, 1, 10, 5],
++          "description": "Type of software raid to use"
++        },
++        "partitions": {
++          "description": "List of partitions to make software raid from",
++          "type": "array",
++          "items": {
++            "type": "string"
++          }
++        }
++      },
++      "additionalProperties": False
++    }
++  },
++  "type": "object",
++  "properties": {
++    "disk_config": {
++      "type": "object",
++      "properties": {
++        "partition_table": {
++          "type": "string",
++          "enum": ["gpt", "mbr"],
++          "default": "mbr",
++          "description": "Partition table type to use"
++        },
++        "blockdev": {
++          "type": "object",
++          "description": "Dictionary of objects representing physical disk",
++          "additionalProperties": {"$ref": "#/definitions/blockdevice"}
++        },
++        "lvm": {
++          "type": "object",
++          "description": "Dictionary of volume groups",
++          "additionalProperties": {"$ref": "#/definitions/volume_group"}
++        },
++        "filesystems": {
++          "type": "object",
++          "description": "Dictionary of filesystems to create",
++          "additionalProperties": {"$ref": "#/definitions/filesystem"}
++        },
++        "swraid": {
++          "type": "object",
++          "description": "Dictionary of software raids to create",
++          "additionalProperties": {"$ref": "#/definitions/software_raid"}
++        },
++        "hwraid": {
++          "type": "object",
++          "description": "Dictionary of hardware raids to create",
++          "additionalProperties": {"$ref": "#/definitions/hwraid"}
++        }
++      },
++      "additionalProperties": False,
++      "required": ["filesystems", "blockdev"]
++    }
++  },
++  "additionalProperties": False,
++  "required": ["disk_config"]
++}
+-- 
+2.16.2
+
