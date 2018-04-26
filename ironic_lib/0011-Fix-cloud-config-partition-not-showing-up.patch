@@ -1,0 +1,45 @@
+From 0e2493445e3223fc5bf7a4a5b36cbe2fd1b449d5 Mon Sep 17 00:00:00 2001
+From: PiotrProkop <piotr.prokop@intel.com>
+Date: Mon, 19 Mar 2018 11:48:06 +0100
+Subject: [PATCH 11/11] Fix cloud-config partition not showing up
+
+---
+ ironic_lib/disk_utils.py            | 1 +
+ ironic_lib/tests/test_disk_utils.py | 2 ++
+ 2 files changed, 3 insertions(+)
+
+diff --git a/ironic_lib/disk_utils.py b/ironic_lib/disk_utils.py
+index 98917f3..c6b814d 100644
+--- a/ironic_lib/disk_utils.py
++++ b/ironic_lib/disk_utils.py
+@@ -797,6 +797,7 @@ def create_config_drive_partition(node_uuid, device, configdrive):
+             LOG.debug('Waiting for the config drive partition %(part)s '
+                       'on node %(node)s to be ready for writing.',
+                       {'part': config_drive_part, 'node': node_uuid})
++            utils.execute('partprobe', config_drive_part.rstrip('1234567890'))
+             utils.execute('udevadm', 'settle',
+                           '--exit-if-exists=%s' % config_drive_part)
+ 
+diff --git a/ironic_lib/tests/test_disk_utils.py b/ironic_lib/tests/test_disk_utils.py
+index a46f985..b4a3e1f 100644
+--- a/ironic_lib/tests/test_disk_utils.py
++++ b/ironic_lib/tests/test_disk_utils.py
+@@ -1068,6 +1068,7 @@ class WholeDiskConfigDriveTestCases(test_base.BaseTestCase):
+         mock_execute.assert_has_calls([
+             mock.call('sgdisk', '-n', '0:-64MB:0', self.dev,
+                       run_as_root=True),
++            mock.call('partprobe', '/dev/fake'),
+             mock.call('udevadm', 'settle',
+                       '--exit-if-exists=%s' % expected_part),
+         ])
+@@ -1158,6 +1159,7 @@ class WholeDiskConfigDriveTestCases(test_base.BaseTestCase):
+                                     '-0', run_as_root=True)
+         mock_execute.assert_has_calls([
+             parted_call,
++            mock.call('partprobe', expected_part.rstrip('1234567890')),
+             mock.call('udevadm', 'settle',
+                       '--exit-if-exists=%s' % expected_part),
+         ])
+-- 
+2.16.2
+
