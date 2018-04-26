@@ -1,0 +1,52 @@
+From 395256c4e80ab1ec573fa7c8957fef909870e49f Mon Sep 17 00:00:00 2001
+From: "Grzegorz Grasza (xek)" <grzegorz.grasza@intel.com>
+Date: Thu, 4 Jan 2018 13:55:10 +0100
+Subject: [PATCH 2/3] Run system_installer functions
+
+---
+ ironic_python_agent/extensions/standby.py | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/ironic_python_agent/extensions/standby.py b/ironic_python_agent/extensions/standby.py
+index 1b9f2db..88662fd 100644
+--- a/ironic_python_agent/extensions/standby.py
++++ b/ironic_python_agent/extensions/standby.py
+@@ -23,6 +23,7 @@ from oslo_config import cfg
+ from oslo_log import log
+ 
+ from ironic_lib import disk_utils
++from ironic_lib import system_installer
+ from ironic_python_agent import errors
+ from ironic_python_agent.extensions import base
+ from ironic_python_agent import hardware
+@@ -451,6 +452,27 @@ class StandbyExtension(base.BaseAgentExtension):
+              large to store on the given device.
+         """
+         LOG.debug('Preparing image %s', image_info['id'])
++
++        if self.agent and self.agent.node['instance_info'].get('ybiip'):
++            disk_config = self.agent.node['instance_info'].get('ybiip')
++            LOG.debug('Found ybiip disk_config in instance_info,'
++                      ' running SystemInstaller...')
++            if image_info.get('disk_format') != 'qcow2':
++                errors.InvalidContentError('qcow2 is the only image format'
++                                           ' supported by SystemInstaller')
++            installer = system_installer.SystemInstaller(disk_config)
++            _download_image(image_info)
++            boot_device = installer.install(_image_location(image_info))
++            if configdrive and boot_device:
++                node_uuid = image_info.get('node_uuid', 'local')
++                disk_utils.create_config_drive_partition(
++                    node_uuid, boot_device, configdrive)
++            msg = 'image ({}) written to device {} '
++            result_msg = _message_format(msg, image_info, boot_device,
++                                         self.partition_uuids)
++            LOG.info(result_msg)
++            return result_msg
++
+         device = hardware.dispatch_to_managers('get_os_install_device')
+ 
+         disk_format = image_info.get('disk_format')
+-- 
+2.14.1
+
