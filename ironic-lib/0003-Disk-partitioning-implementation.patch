@@ -1,0 +1,706 @@
+From afc04dfa6a798356dea0ce5d78dd32cf9c386f42 Mon Sep 17 00:00:00 2001
+From: "Grzegorz Grasza (xek)" <grzegorz.grasza@intel.com>
+Date: Thu, 11 Jan 2018 16:49:05 +0100
+Subject: [PATCH 03/11] Disk partitioning implementation
+
+Co-Authored-By: Grzegorz Grasza <grzegorz.grasza@intel.com>
+Co-Authored-By: Marta Mucek <marta.mucek@intel.com>
+---
+ ironic_lib/system_installer/exceptions.py      |   4 +
+ ironic_lib/system_installer/filesystemsetup.py |   9 +
+ ironic_lib/system_installer/partitionsetup.py  | 219 +++++++++++++++++
+ ironic_lib/system_installer/tools.py           |   7 +
+ ironic_lib/tests/test_examples.py              |   5 +-
+ ironic_lib/tests/test_partitionsetup.py        | 324 +++++++++++++++++++++++++
+ ironic_lib/tests/test_tools.py                 |  35 +++
+ 7 files changed, 601 insertions(+), 2 deletions(-)
+ create mode 100644 ironic_lib/tests/test_partitionsetup.py
+ create mode 100644 ironic_lib/tests/test_tools.py
+
+diff --git a/ironic_lib/system_installer/exceptions.py b/ironic_lib/system_installer/exceptions.py
+index 6dcfa46..2f7998f 100644
+--- a/ironic_lib/system_installer/exceptions.py
++++ b/ironic_lib/system_installer/exceptions.py
+@@ -24,3 +24,7 @@ class ConfError(SystemInstallerException):
+ 
+ class EnvError(SystemInstallerException):
+     """Error in the setup environment"""
++
++
++class AssignFail(EnvError):
++    pass
+diff --git a/ironic_lib/system_installer/filesystemsetup.py b/ironic_lib/system_installer/filesystemsetup.py
+index e3157d2..6ed64d6 100644
+--- a/ironic_lib/system_installer/filesystemsetup.py
++++ b/ironic_lib/system_installer/filesystemsetup.py
+@@ -32,3 +32,12 @@ class FilesystemSetup(Setup):
+ 
+     def get_disks_by_labels(self):
+         return {}
++
++    def is_efi_boot(self):
++        return False
++
++    def get_boot_partition(self):
++        pass  # TODO(xek)
++
++    def get_fstype(self, label):
++        return ''  # TODO(xek)
+diff --git a/ironic_lib/system_installer/partitionsetup.py b/ironic_lib/system_installer/partitionsetup.py
+index af318d1..8f22a9d 100644
+--- a/ironic_lib/system_installer/partitionsetup.py
++++ b/ironic_lib/system_installer/partitionsetup.py
+@@ -13,7 +13,22 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++from collections import OrderedDict
++import json
++
++import bitmath
++from oslo_concurrency import processutils
++from oslo_log import log
++
++from ironic_lib.disk_partitioner import DiskPartitioner
++from ironic_lib import disk_utils
+ from ironic_lib.system_installer.base import Setup
++from ironic_lib.system_installer import exceptions
++from ironic_lib.system_installer.filesystemsetup import FilesystemSetup
++from ironic_lib.system_installer import tools
++from ironic_lib import utils
++
++LOG = log.getLogger()
+ 
+ 
+ class PartitionSetup(Setup):
+@@ -21,7 +36,211 @@ class PartitionSetup(Setup):
+ 
+     conf_key = 'blockdev'
+ 
++    def __init__(self, conf):
++        if FilesystemSetup.conf_key in conf:
++            self._filesystems = FilesystemSetup(conf)
++        else:  # this case is rare, mainly for testing and running independent
++            self._filesystems = FilesystemSetup({FilesystemSetup.conf_key: {}})
++        self._boot_partition = self._filesystems.get_boot_partition()
++        self._efi_boot = self._filesystems.is_efi_boot()
++        default_partition_table = 'mbr'
++        if self._efi_boot:
++            default_partition_table = 'gpt'
++        types_translation = {'mbr': 'msdos'}
++        table = conf.get('partition_table', default_partition_table)
++        self._partition_type = types_translation.get(table, table)
++        super(PartitionSetup, self).__init__(conf)
++
++    def validate_conf(self):
++        for disk_name, disk in self.conf.items():
++            minsizes = 0
++            number_of_partitions = 0
++            for label, partition in disk.get('partitions', {}).items():
++                number_of_partitions += 1
++                if 'minsize' in partition:
++                    minsizes += 1
++            if minsizes > 1:
++                raise exceptions.ConfError(
++                    'More than one minsize not supported')
++            if number_of_partitions > 4 and \
++                    self._partition_type != 'gpt':
++                raise exceptions.ConfError(
++                    'More than 4 partitions per disk are not allowed')
++
++    def validate_env(self):
++        """Check that disks exist"""
++        lsblk_version, err = utils.execute("lsblk --version", shell=True)
++        if float('.'.join(lsblk_version.split()[-1].split('.')[:2])) < 2.27:
++            raise exceptions.EnvError('lsblk version >= 2.27 is required')
++        if len(self._get_physical_drives()) < len([
++                v for v in self.conf.values() if 'candidates' in v]):
++            raise exceptions.EnvError('Not enough physical drives')
++        candidates = self._assign_candidates()
++        for label, partition in self.conf.items():
++            if 'candidates' in partition:
++                try:
++                    candidates[label]
++                except KeyError:
++                    raise exceptions.EnvError(
++                        'No candidates for blockdev {}'.format(label))
++
+     def get_dst_names(self):
+         partitions = [list(v.get('partitions', {}))
+                       for v in self.conf.values()]
+         return sum(partitions, [])
++
++    def setup_disks(self, devices):
++        devices.update(self._assign_candidates(devices))
++        disksizes = {d['name']: d['size'] for d in self._get_physical_drives()}
++        for label, disk in self.conf.items():
++            if not disk.get('partitions'):
++                continue
++            try:
++                device_name = devices[label]
++            except KeyError:
++                raise exceptions.EnvError(
++                    'No candidates for blockdev {}'.format(label))
++            remaining_size = bitmath.Byte(disksizes[device_name])
++            partitioner = DiskPartitioner(device_name, self._partition_type)
++            last_partition = None
++            names = []
++            for name, partition in disk['partitions'].items():
++                names.append(name)
++                if 'size' in partition:
++                    if partition['size'] == 'memsize':
++                        size = bitmath.parse_string_unsafe(
++                            tools.get_memsize_kB())
++                    else:
++                        size = bitmath.parse_string_unsafe(partition['size'])
++                    # TODO(xek): create partition labels for preserve function?
++                    partitioner.add_partition(
++                        int(size.to_MiB().value),
++                        fs_type=partition.get(
++                            'type', self._filesystems.get_fstype(label)),
++                        boot_flag=self._boot_flag(name))
++                    remaining_size -= size
++                    if remaining_size <= 0:
++                        raise exceptions.EnvError(
++                            "Partitions don't fit on disk")
++                elif 'minsize' in partition:
++                    last_partition = partition
++                else:
++                    raise exceptions.EnvError(
++                        'No candidates for {}'.format(name))
++            if last_partition:
++                # TODO(xek): create partition labels for preserve function?
++                partitioner.add_partition(
++                    int(remaining_size.to_MiB().value - 1
++                        - disk_utils.MAX_CONFIG_DRIVE_SIZE_MB),
++                    boot_flag=self._boot_flag(name))
++            partitioner.commit()
++            created = self._gather_created_devices(device_name)
++            devices.update(zip(names, created))
++
++        return devices
++
++    def get_not_partitioned_candidates(self, candidates=None):
++        if not candidates:
++            candidates = self._assign_candidates()
++        try:
++            return {label: candidates[label]
++                    for label, disk in self.conf.items()
++                    if not disk.get('partitions')}
++        except KeyError as e:
++            raise exceptions.EnvError(
++                'No candidates for blockdev {}'.format(e.args[0]))
++
++    def _boot_flag(self, name):
++        if self._boot_partition == name:
++            if self._partition_type == 'gpt' and not self._efi_boot:
++                return 'bios_grub'
++            return 'boot'
++        return None
++
++    def _assign_candidates(self, devices={}):
++        "Returns dict of {label: candidate}, given a dict of already assigned."
++        def assign_disks(devices, partitions):
++            if not partitions:
++                return {}
++            for label, partition in partitions.items():
++                candidates = self._filter_candidates(
++                    partition['candidates'], devices)
++                for device in candidates:
++                    assigned = {label: device['name']}
++                    devices_ = devices[:]
++                    devices_.remove(device)
++                    partitions_ = partitions.copy()
++                    del partitions_[label]
++                    try:
++                        assigned.update(assign_disks(devices_, partitions_))
++                        return assigned
++                    except exceptions.AssignFail:
++                        pass
++            raise exceptions.AssignFail('No candidates')
++        # Don't assign disk candidates to devices with no candidates entry.
++        with_candidates = OrderedDict([
++            (label, part) for label, part in self.conf.items()
++            if 'candidates' in part and label not in devices])
++        # Already assigned disks are present in the devices dict.
++        return assign_disks(self._get_physical_drives(), with_candidates)
++
++    @staticmethod
++    def _filter_candidates(hints, devices):
++        " Filter devices according to hints. "
++        if hints == 'any':
++            return devices
++        if 'serial' in hints:
++            return [d for d in devices if d['serial'] == hints['serial']]
++        if 'model' in hints:  # assuming all instances of model have same size
++            return [d for d in devices if d['model'] == hints['model']]
++        if 'type' in hints:
++            devices = [d for d in devices if d['type'] == hints['type']]
++        if 'size' in hints:
++            devices = [d for d in devices
++                       if d['size'] <= int(hints['max_disk_size_gb']) * 1e+9]
++        return devices
++
++    @staticmethod
++    def _get_physical_drives():
++        try:
++            drives_json, err = utils.execute(
++                'lsblk', '-Jbde1,7', '-o', 'NAME,ROTA,SERIAL,MODEL,SIZE')
++            if err:
++                raise processutils.ProcessExecutionError(err)
++            blockdevices = json.loads(drives_json)['blockdevices']
++            for d in blockdevices:
++                d['name'] = '/dev/' + d['name']
++                d['size'] = int(d['size'])
++                rotating = int(d['rota'])
++                if rotating:
++                    d['type'] = 'HDD'
++                elif 'nvme' in d['name']:
++                    d['type'] = 'NVMe'
++                else:
++                    d['type'] = 'SSD'
++                del d['rota']
++            return [b for b in blockdevices if all(b.values())]
++        except (processutils.ProcessExecutionError, OSError):
++            raise exceptions.EnvError("Error getting details of devices.")
++
++    @staticmethod
++    def _gather_created_devices(dev):
++        try:
++            drives_json, err = utils.execute('lsblk', '-Jpo', 'NAME', dev)
++            if err:
++                raise processutils.ProcessExecutionError(err)
++            devices = json.loads(drives_json)['blockdevices']
++        except (processutils.ProcessExecutionError, OSError):
++            raise exceptions.EnvError("Error getting details of devices.")
++
++        result = []
++
++        def add_devices(tree):
++            for dev in tree:
++                if 'children' in dev:
++                    add_devices(dev['children'])
++                else:
++                    result.append(dev['name'])
++
++        add_devices(devices)
++        return result
+diff --git a/ironic_lib/system_installer/tools.py b/ironic_lib/system_installer/tools.py
+index 71f6d60..aaacf67 100644
+--- a/ironic_lib/system_installer/tools.py
++++ b/ironic_lib/system_installer/tools.py
+@@ -34,3 +34,10 @@ def ordered_load(disk_conf):
+             yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+             construct_mapping)
+         return yaml.load(disk_conf, OrderedLoader)
++
++
++def get_memsize_kB():
++    """Get memory size of machine"""
++    with open('/proc/meminfo', 'r') as f:
++        # take first line which is MemTotal and grab its value with unit
++        return f.read().split('\n')[0].split()[1]
+diff --git a/ironic_lib/tests/test_examples.py b/ironic_lib/tests/test_examples.py
+index 05b5cc7..e69bc2d 100644
+--- a/ironic_lib/tests/test_examples.py
++++ b/ironic_lib/tests/test_examples.py
+@@ -15,6 +15,7 @@
+ 
+ from oslotest import base as test_base
+ 
++from ironic_lib.system_installer import exceptions
+ from ironic_lib.system_installer import SystemInstaller
+ 
+ EXAMPLES_DIR = 'ironic_lib/tests/examples/'
+@@ -61,7 +62,7 @@ class SystemInstallerExamplesTestCase(test_base.BaseTestCase):
+ 
+     def test_yse_bnode_4disk(self):
+         y = SystemInstaller(open(EXAMPLES_DIR + 'yse_bnode_4disk.yaml').read())
+-        y.validate_conf()
++        self.assertRaises(exceptions.ConfError, y.validate_conf)
+ 
+     def test_yse_bnode_4disk_gpt(self):
+         y = SystemInstaller(
+@@ -71,7 +72,7 @@ class SystemInstallerExamplesTestCase(test_base.BaseTestCase):
+     def test_yse_bnode_fsprofile(self):
+         y = SystemInstaller(
+             open(EXAMPLES_DIR + 'yse_bnode_fsprofile.yaml').read())
+-        y.validate_conf()
++        self.assertRaises(exceptions.ConfError, y.validate_conf)
+ 
+     def test_megacli_partitions(self):
+         y = SystemInstaller(
+diff --git a/ironic_lib/tests/test_partitionsetup.py b/ironic_lib/tests/test_partitionsetup.py
+new file mode 100644
+index 0000000..69c14b4
+--- /dev/null
++++ b/ironic_lib/tests/test_partitionsetup.py
+@@ -0,0 +1,324 @@
++# Copyright (c) 2018 Intel Corporation
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++# implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from collections import OrderedDict
++import unittest
++
++import mock
++
++from ironic_lib.system_installer import exceptions
++from ironic_lib.system_installer import partitionsetup
++
++
++class PartitionSetupTestCase(unittest.TestCase):
++
++    def test_validate_conf(self):
++        partition_setup = partitionsetup.PartitionSetup(
++            {'blockdev': {'sda': {
++                'candidates': 'any',
++                'partitions': {
++                    'd0p1': {'size': '512M'},
++                    'd0p2': {'minsize': '2G'}}
++            }}})
++        partition_setup.validate_conf()
++
++    def test_validate_conf_error(self):
++        partition_setup = partitionsetup.PartitionSetup(
++            {'blockdev': {'sda': {
++                'candidates': 'any',
++                'partitions': {
++                    'd0p1': {'size': '512M'},
++                    'd0p2': {'minsize': '2G'},
++                    'd0p3': {'minsize': '2G'}}
++            }}})
++        with self.assertRaises(exceptions.ConfError):
++            partition_setup.validate_conf()
++
++    def test_get_dst_names(self):
++        partition_setup = partitionsetup.PartitionSetup(
++            {'blockdev': {
++                'sda': {
++                    'candidates': 'any',
++                    'partitions': {
++                        'd0p1': {'size': '512M'},
++                        'd0p2': {'minsize': '2G'}}},
++                'sdb': {
++                    'candidates': 'any',
++                    'partitions': {
++                        'd1p1': {'size': '512M'},
++                        'd1p2': {'minsize': '2G'}}}}})
++        self.assertEqual(set(partition_setup.get_dst_names()),
++                         {'d0p1', 'd0p2', 'd1p1', 'd1p2'})
++
++    def test_get_not_partitioned_candidates_empty(self):
++        with mock.patch.object(
++                partitionsetup.PartitionSetup, '_get_physical_drives',
++                return_value=[
++                    {'model': 'fake_model',
++                     'name': 'sda',
++                     'serial': 'fake_serial',
++                     'size': 250000000000,
++                     'type': 'HDD'},
++                    {'model': 'fake_model',
++                     'name': 'sdb',
++                     'serial': 'fake_serial',
++                     'size': 250000000000,
++                     'type': 'HDD'}]):
++            partition_setup = partitionsetup.PartitionSetup(
++                {'blockdev': {
++                    'sda_label': {
++                        'candidates': 'any',
++                        'partitions': {
++                            'd0p1': {'size': '512M'},
++                            'd0p2': {'minsize': '2G'}}},
++                    'sdb_label': {
++                        'candidates': 'any',
++                        'partitions': {
++                            'd1p1': {'size': '512M'},
++                            'd1p2': {'minsize': '2G'}}}}})
++            self.assertEqual(partition_setup.get_not_partitioned_candidates(),
++                             {})
++
++    def test_get_not_partitioned_candidates(self):
++        with mock.patch.object(
++                partitionsetup.PartitionSetup, '_get_physical_drives',
++                return_value=[
++                    {'model': 'fake_model',
++                     'name': '/dev/sda',
++                     'serial': 'fake_serial',
++                     'size': 250000000000,
++                     'type': 'HDD'},
++                    {'model': 'fake_model',
++                     'name': '/dev/sdb',
++                     'serial': 'fake_serial',
++                     'size': 250000000000,
++                     'type': 'HDD'}]):
++            partition_setup = partitionsetup.PartitionSetup(
++                {'blockdev': OrderedDict([
++                    ('sda_label', {
++                        'candidates': 'any',
++                        'partitions': {
++                            'd0p1': {'size': '512M'},
++                            'd0p2': {'minsize': '2G'}}
++                    }),
++                    ('sdb_label', {
++                        'candidates': 'any'
++                    })])})
++            self.assertDictEqual(
++                partition_setup.get_not_partitioned_candidates(),
++                {'sdb_label': '/dev/sdb'})
++
++    def test_validate_env(self):
++        with mock.patch.object(
++                partitionsetup.PartitionSetup, '_get_physical_drives',
++                return_value=[
++                    {'model': 'fake_model',
++                     'name': '/dev/sda',
++                     'serial': 'fake_serial',
++                     'size': 250000000000,
++                     'type': 'HDD'}]):
++            partition_setup = partitionsetup.PartitionSetup(
++                {'blockdev': {'sda': {'candidates': 'any',
++                                      'partitions': {
++                                          'd0p1': {'size': '512M'},
++                                          'd0p2': {'minsize': '2G'}}}}})
++            partition_setup.validate_env()
++
++    def test_validate_env_match_fail(self):
++        with mock.patch.object(
++                partitionsetup.PartitionSetup, '_get_physical_drives',
++                return_value=[
++                    {'model': 'fake_model',
++                     'name': '/dev/sda',
++                     'serial': 'fake_serial',
++                     'size': 250000000000,
++                     'type': 'HDD'}]):
++            partition_setup = partitionsetup.PartitionSetup(
++                {'blockdev': {
++                    'sda': {
++                        'candidates': 'any',
++                        'partitions': {
++                            'd0p1': {'size': '512M'},
++                            'd0p2': {'minsize': '2G'}}},
++                    'sdb': {
++                        'candidates': 'any',
++                        'partitions': {
++                            'd1p1': {'size': '512M'},
++                            'd1p2': {'minsize': '2G'}}}}})
++            with self.assertRaises(exceptions.EnvError):
++                partition_setup.validate_env()
++
++    @mock.patch.object(partitionsetup.PartitionSetup, '_get_physical_drives')
++    def test_validate_env_physical_count(self, get_drives_mock):
++        get_drives_mock.return_value = [
++            {'model': 'fake_model',
++             'name': 'sdb',
++             'serial': 'fake_serial',
++             'size': 250000000000,
++             'type': 'HDD'},
++            {'model': 'fake_model',
++             'name': 'sdc',
++             'serial': 'fake_serial',
++             'size': 250000000000,
++             'type': 'HDD'}]
++        partition_setup = partitionsetup.PartitionSetup(
++            {'blockdev': {
++                'sda': {'candidates': 'any'},
++                'sdb': {'candidates': 'any'},
++                'raid1': {
++                    'partitions': {
++                        'd0p1': {'size': '512M'},
++                        'd0p2': {'minsize': '2G'},
++                        'd0p3': {'minsize': '2G'}}
++                }}})
++        partition_setup.validate_env()
++
++    @mock.patch.object(partitionsetup.PartitionSetup, '_get_physical_drives')
++    def test_validate_env_physical_count_error(self, get_drives_mock):
++        get_drives_mock.return_value = [
++            {'model': 'fake_model',
++             'name': 'sdb',
++             'serial': 'fake_serial',
++             'size': 250000000000,
++             'type': 'HDD'}]
++        partition_setup = partitionsetup.PartitionSetup(
++            {'blockdev': {
++                'sda': {'candidates': 'any'},
++                'sdb': {'candidates': 'any'},
++                'raid1': {
++                    'partitions': {
++                        'd0p1': {'size': '512M'},
++                        'd0p2': {'minsize': '2G'},
++                        'd0p3': {'minsize': '2G'}}
++                }}})
++        with self.assertRaises(exceptions.EnvError):
++            partition_setup.validate_env()
++
++    def test_setup_disks(self):
++
++        def execute_result(command, *args, **kwargs):
++            if command == 'lsblk':
++                return ("""{
++   "blockdevices": [
++      {"name": "/dev/sda",
++         "children": [
++            {"name": "/dev/sda1"},
++            {"name": "/dev/sda2"},
++            {"name": "/dev/sda3",
++               "children": [
++                    {"name": "/dev/sda5"},
++                    {"name": "/dev/sda6"}
++               ]
++            }
++         ]
++      }
++   ]
++    }""", '')
++            return ('', '')
++
++        physical_drives = [
++            {'model': 'fake_model',
++             'name': '/dev/sda',
++             'serial': 'fake_serial',
++             'size': 250000000000,
++             'type': 'HDD'}]
++
++        with mock.patch.object(
++                partitionsetup.PartitionSetup, '_get_physical_drives',
++                return_value=physical_drives), \
++                mock.patch('ironic_lib.utils.execute',
++                           side_effect=execute_result) as exec_mock:
++
++            partition_setup = partitionsetup.PartitionSetup(
++                {'partition_table': 'gpt',
++                 'blockdev': {'root_disk': {
++                     'candidates': 'any',
++                     'partitions': OrderedDict([
++                         ('d0p1', {'size': '512M'}),
++                         ('d0p2', {'size': '512M', 'type': 'ntfs'}),
++                         ('d0p3', {'size': '512M'}),
++                         ('d0p4', {'minsize': '2G'})])}}})
++            result = partition_setup.setup_disks({})
++            self.assertDictEqual(
++                result, {'d0p1': '/dev/sda1', 'd0p2': '/dev/sda2',
++                         'd0p3': '/dev/sda5', 'd0p4': '/dev/sda6',
++                         'root_disk': '/dev/sda'})
++            self.assertIn('gpt', exec_mock.mock_calls[0][1])
++            self.assertIn('ntfs', exec_mock.mock_calls[2][1])
++
++    def test_setup_disks_size_fail(self):
++        with mock.patch.object(
++                partitionsetup.PartitionSetup, '_get_physical_drives',
++                return_value=[
++                    {'model': 'fake_model',
++                     'name': '/dev/sda',
++                     'serial': 'fake_serial',
++                     'size': 250000000000,
++                     'type': 'HDD'}]):
++
++            partition_setup = partitionsetup.PartitionSetup(
++                {'blockdev': {'sda': {
++                    'candidates': 'any',
++                    'partitions': OrderedDict([
++                        ('d0p1', {'size': '512G'}),
++                        ('d0p2', {'size': '512G'}),
++                        ('d0p3', {'size': '512G'}),
++                        ('d0p4', {'minsize': '2G'})])
++                }}})
++            with self.assertRaises(exceptions.EnvError):
++                partition_setup.setup_disks({})
++
++    def test_assign_candidates(self):
++        with mock.patch.object(
++                partitionsetup.PartitionSetup, '_get_physical_drives',
++                return_value=[{u'name': u'/dev/sda',
++                               u'model': u'INTEL SSDSC2BB24',
++                               'type': 'SSD',
++                               u'serial': u'55cd2e404c02b114',
++                               u'size': 240057409536},
++                              {u'name': u'/dev/sdb',
++                               u'model': u'INTEL SSDSC2BB24',
++                               'type': 'SSD',
++                               u'serial': u'55cd2e404c02b181',
++                               u'size': 240057409536}]):
++            partition_setup = partitionsetup.PartitionSetup(
++                {'blockdev': {'sda': {
++                    'candidates': 'any',
++                    'partitions': {
++                        'd0p1': {
++                            'size': '512M'},
++                        'd0p2': {
++                            'minsize': '2G'}}}}})
++            partition_setup._assign_candidates()
++
++    def test_assign_candidates_fail(self):
++        with mock.patch.object(
++                partitionsetup.PartitionSetup, '_get_physical_drives',
++                return_value=[{u'name': u'/dev/sda',
++                               u'model': u'INTEL SSDSC2BB24',
++                               'type': 'SSD',
++                               u'serial': u'55cd2e404c02b114',
++                               u'size': 240057409536},
++                              {u'name': u'/dev/sdb',
++                               u'model': u'INTEL SSDSC2BB24',
++                               'type': 'SSD',
++                               u'serial': u'55cd2e404c02b181',
++                               u'size': 240057409536}]):
++            partition_setup = partitionsetup.PartitionSetup(
++                {'blockdev': {'sda': {'candidates': 'any'},
++                              'sdb': {'candidates': 'any'},
++                              'sdc': {'candidates': 'any'}}})
++            with self.assertRaises(exceptions.EnvError):
++                partition_setup._assign_candidates()
+diff --git a/ironic_lib/tests/test_tools.py b/ironic_lib/tests/test_tools.py
+new file mode 100644
+index 0000000..6e0cd12
+--- /dev/null
++++ b/ironic_lib/tests/test_tools.py
+@@ -0,0 +1,35 @@
++# Copyright (c) 2018 Intel Corporation
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++# implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import unittest
++
++import ironic_lib.system_installer.tools as tools
++import mock
++
++
++class ToolsTest(unittest.TestCase):
++
++    @mock.patch('ironic_lib.system_installer.tools.open')
++    def test_get_memsize(self, op):
++        meminfo = "\n".join(["MemTotal:       32825036 kB",
++                             "MemFree:        18416836 kB",
++                             "MemAvailable:   25979788 kB",
++                             "Buffers:         1561440 kB"])
++
++        op.return_value = mock.mock_open(read_data=meminfo).return_value
++
++        memsize = tools.get_memsize_kB()
++        print(memsize)
++        self.assertEqual("32825036", memsize)
+-- 
+2.14.1
+
