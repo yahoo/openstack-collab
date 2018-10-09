@@ -1,0 +1,112 @@
+From 0dc19ff43d1824fa3d279f63a8b251761261b053 Mon Sep 17 00:00:00 2001
+From: Arun S A G <saga@yahoo-inc.com>
+Date: Fri, 6 Apr 2018 16:22:36 -0700
+Subject: [PATCH] Add athenz token to fernet token
+
+The athenz role token will now be inside the regular fernet
+token so that it may be retrieved for calling outside services
+on the user's behalf.
+
+Do not validate scope data before authenticating the user
+in case auth_method is athenz_token.
+
+Be sure to create the user with the 'id' that is passed in
+---
+ keystone/auth/controllers.py            | 11 +++++++++--
+ keystone/identity/core.py               |  4 +++-
+ keystone/tests/unit/test_backend_sql.py |  8 ++++++++
+ keystone/token/providers/common.py      | 10 +++++++++-
+ 4 files changed, 29 insertions(+), 4 deletions(-)
+
+diff --git a/keystone/auth/controllers.py b/keystone/auth/controllers.py
+index bdc7ba569..c73f141d2 100644
+--- a/keystone/auth/controllers.py
++++ b/keystone/auth/controllers.py
+@@ -108,13 +108,20 @@ class Auth(controller.V3Controller):
+         include_catalog = 'nocatalog' not in request.params
+ 
+         validate_issue_token_auth(auth)
++        authenticated = False
+ 
+         try:
+-            auth_info = core.AuthInfo.create(auth=auth)
++            auth_info_no_scope = core.AuthInfo(auth)
+             auth_context = core.AuthContext(extras={},
+                                             method_names=[],
+                                             bind={})
+-            self.authenticate(request, auth_info, auth_context)
++            if 'athenz_token' in auth['identity']['methods']:
++                self.authenticate(request, auth_info_no_scope, auth_context)
++                authenticated = True
++            auth_info = core.AuthInfo.create(auth=auth)
++
++            if not authenticated:
++                self.authenticate(request, auth_info, auth_context)
+             if auth_context.get('access_token_id'):
+                 auth_info.set_scope(None, auth_context['project_id'], None)
+             self._check_and_set_default_scoping(auth_info, auth_context)
+diff --git a/keystone/identity/core.py b/keystone/identity/core.py
+index 5168bf01f..9d8f65c5b 100644
+--- a/keystone/identity/core.py
++++ b/keystone/identity/core.py
+@@ -935,7 +935,9 @@ class Manager(manager.Manager):
+         # Generate a local ID - in the future this might become a function of
+         # the underlying driver so that it could conform to rules set down by
+         # that particular driver type.
+-        user['id'] = uuid.uuid4().hex
++        # (saga): In case of athenz_token auth method, we pass in our own id
++        if 'id' not in user:
++            user['id'] = uuid.uuid4().hex
+         ref = driver.create_user(user['id'], user)
+         notifications.Audit.created(self._USER, user['id'], initiator)
+         return self._set_domain_id_and_mapping(
+diff --git a/keystone/tests/unit/test_backend_sql.py b/keystone/tests/unit/test_backend_sql.py
+index aee804573..1b727f446 100644
+--- a/keystone/tests/unit/test_backend_sql.py
++++ b/keystone/tests/unit/test_backend_sql.py
+@@ -290,6 +290,14 @@ class SqlIdentity(SqlTests,
+ 
+         # assign a new ID with the same name, but this time in uppercase
+         ref['name'] = ref['name'].upper()
++
++        # (saga) When 'id' is passed to create_user, we create user with that
++        # ID instead of generating a new one. In this case if the ID from ref
++        # object is not deleted, below call to create_user will result in
++        # conflict, because there is an user with same ID is already created
++        # above.
++        del ref['id']
++
+         self.identity_api.create_user(ref)
+ 
+     def test_create_project_case_sensitivity(self):
+diff --git a/keystone/token/providers/common.py b/keystone/token/providers/common.py
+index d29d6f832..9b015149c 100644
+--- a/keystone/token/providers/common.py
++++ b/keystone/token/providers/common.py
+@@ -390,7 +390,8 @@ class V3TokenDataHelper(object):
+ 
+         # We've probably already written these to the token
+         if token:
+-            for x in ('roles', 'user', 'catalog', 'project', 'domain'):
++            for x in ('roles', 'user', 'catalog', 'project', 'domain',
++                      'athenz_token'):
+                 if x in token:
+                     token_data[x] = token[x]
+ 
+@@ -462,6 +463,13 @@ class BaseProvider(base.Provider):
+             token_ref = self._handle_mapped_tokens(
+                 auth_context, project_id, domain_id)
+ 
++        if auth_context and 'athenz_token' in auth_context:
++            token_dict = {'athenz_token': auth_context['athenz_token']}
++            if token_ref is None:
++                token_ref = token_dict
++            else:
++                token_ref.update(token_dict)
++
+         access_token = None
+         if 'oauth1' in method_names:
+             access_token_id = auth_context['access_token_id']
+-- 
+2.14.3
+
