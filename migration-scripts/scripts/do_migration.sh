@@ -224,14 +224,6 @@ for comp in $components ; do
   done
 done
 
-# Remove old endpoints (chef deploy will re-populate these with correct values)
+# Remove old endpoints (deployment will re-populate these with correct values)
 mysql -u $db_user --password=$db_pass -h $db_host -e 'USE keystone; DELETE FROM endpoint;'
 mysql -u $db_user --password=$db_pass -h $db_host -e 'USE keystone; DELETE FROM service;'
-# Remove invalid role assignments (missing user)
-
-# Change legacy "config_drive" key to what is used upstream "configdrive"
-# NOTE(jaypipes): This may take a multiple dozens of seconds on a table with
-# tens of thousands of records
-if [ "$baremetal" == 1 ]; then
-  mysql -u $db_user --password=$db_pass -h $db_host -e 'USE ironic; UPDATE nodes SET instance_info = REPLACE(instance_info, "\"config_drive\":", "\"configdrive\":");'
-fi
