@@ -10,4 +10,8 @@ Vagrant.configure("2") do |config|
     v.cpus = 4
     v.storage :file, :size => '40G'
   end
+  config.vm.provider "virtualbox" do |v|
+    v.memory = 8192
+    v.cpus = 4
+  end
 end
