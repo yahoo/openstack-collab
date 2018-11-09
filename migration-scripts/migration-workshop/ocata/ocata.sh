@@ -6,7 +6,7 @@ set -e
 set -x
 ROOT_DIR=/vagrant/ocata
 
-yum remove -y docker-ce || :
+yum remove -y docker-ce docker-ce-cli || :
 rm -f /etc/yum.repos.d/docker-ce.repo || :
 umount /var/lib/docker/devicemapper/ || :
 rm -rf /var/lib/docker/ || :
