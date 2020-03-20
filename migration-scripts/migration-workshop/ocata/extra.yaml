@@ -1,3 +1,4 @@
+# The passwords in this file are only used for demo/workshop purposes
 kolla_base_distro: "centos"
 kolla_install_type: "source"
 openstack_release: "ocata"

@@ -1,3 +1,5 @@
+DB migration workshop and demo resources - Open Infra Summit Berlin 2018
+===
 
 Database Migration Workshop Instructions
 
